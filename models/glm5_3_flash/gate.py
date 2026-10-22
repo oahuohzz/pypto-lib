@@ -6,9 +6,9 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Sigmoid ``noaux_tc`` router over 288 experts, fused with the deferred norm and quant.
+"""Sigmoid ``noaux_tc`` router over 288 experts, fused with RMSNorm and quantization.
 
-``scores = sigmoid(x @ gate_weight.T)`` in FP32; selection ranks
+``scores = sigmoid(x_norm @ gate_weight.T)`` in FP32; selection ranks
 ``scores + e_score_correction_bias`` and takes the top 8; the returned weights are
 the *unbiased* scores, renormalised (``norm_topk_prob``) and scaled by
 ``routed_scaling_factor = 2.5``. ``n_group`` and ``topk_group`` are both 1, so the
@@ -18,9 +18,9 @@ grouped masking of ``DeepseekV3TopkRouter`` degenerates to a plain top-k.
 is FP32 ``[288]``; ``moe_router_dtype`` is ``float32``, so the matmul accumulates
 and everything downstream of it stays in FP32.
 
-Like the a2a3 sibling's ``models/deepseek_v4_flash_mtp/gate.py``, this kernel also
-owns the deferred RMSNorm and the per-token INT8 quantization, so the INT8 view is
-produced once and reused by both the shared expert and the EP dispatch payload.
+Routing consumes the BF16-rounded normalized activation. The INT8 branch keeps
+FP32 ``x * gamma`` and folds the inverse RMS into its dequantization scale; its
+INT8 view is produced once for the shared expert and the EP dispatch payload.
 
 The sort is the one place the 288-expert row departs from the sibling. That
 sibling pads to ``SCORE_PAD = 256`` and stops after two ``pl.mrgsort`` stages;
@@ -117,15 +117,9 @@ def moe_gate(
 ):
     token_rows = pl.tensor.dim(x, 0)
     padded_rows = ((token_rows + GATE_M_TILE - 1) // GATE_M_TILE) * GATE_M_TILE
-    # Deferred RMSNorm (qwen3-style): store xg = x*gamma (NOT *inv_rms), because
-    # the per-token positive scalar inv_rms factors out of everything downstream:
-    #   - gate logits: inv_rms * (xg @ gate_w.T)  -> applied as a [16,1] row-scale
-    #   - int8 quant : symmetric per-token quant of xg CANCELS inv_rms exactly;
-    #                  inv_rms rides only x_scale (= inv_rms * amax(xg)/127).
-    # This lets sq_sum (needs raw x) and xg share ONE pass over x instead of
-    # a sqsum pass followed by a separate normalize pass.
+    # Quantization uses FP32 x*gamma; routing uses BF16(x*inv_rms*gamma).
     xg_buf = pl.create_tensor([padded_rows, D], dtype=pl.FP32)
-    inv_rms_buf = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
+    route_input_buf = pl.create_tensor([padded_rows, D], dtype=pl.BF16)
     # per-token int8 quant scale (= INT8_SCALE_MAX / amax(xg)), computed in ffn_norm
     # and consumed by x_quant so quant skips its own amax pass.
     xn_scale_buf = pl.create_tensor([padded_rows, 1], dtype=pl.FP32)
@@ -160,7 +154,11 @@ def moe_gate(
             sq_sum = pl.row_sum(sq_reduce, sq_sum_tmp)
             sq_sum = pl.set_validshape(pl.reshape(sq_sum, [1, ROW_PAD]), 1, 1)
             inv_rms = pl.recip(pl.sqrt(pl.add(pl.mul(sq_sum, 1.0 / D), NORM_EPS)))
-            pl.tile.store(inv_rms, [tok, 0], inv_rms_buf, shapes=[1, 1])
+            route_inv_rms = pl.tile.read(inv_rms, [0, 0])
+            route_normalized = pl.mul(rms_x, route_inv_rms)
+            route_weighted = pl.mul(route_normalized, rms_w)
+            route_input = pl.cast(route_weighted, pl.BF16, mode="rint")
+            pl.tile.store(route_input, [tok, 0], route_input_buf, shapes=[1, D])
 
             xg_abs_rows = pl.reshape(pl.abs(xg), [ROW_PAD, FFN_REDUCE_TILE])
             amax_partial_tmp = pl.create_tile([ROW_PAD, FFN_REDUCE_TILE], dtype=pl.FP32)
@@ -233,10 +231,8 @@ def moe_gate(
                     value=FP32_NEG_INF,
                 )
 
-    # Gate matmul: xg @ gate_w.T → FP32 logits, then sigmoid scores. The matmul
-    # input is the BF16 view of xg (gate_w is BF16 too); inv_rms rides the logits
-    # as a per-token row scale, and only the *biased* scores feed the sort.
     if active_tokens > 0:
+        # BF16 normalized routing inputs produce FP32 logits and sigmoid scores.
         for gb_idx in pl.spmd(active_gate_tiles * (N_EXPERTS // GATE_N_TILE), name_hint="gate", allow_early_resolve=True):
             tg = gb_idx // (N_EXPERTS // GATE_N_TILE)
             nb = gb_idx % (N_EXPERTS // GATE_N_TILE)
@@ -245,14 +241,12 @@ def moe_gate(
             gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
             for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
                 gd_kd = kb * GATE_D_TILE
-                gd_x = pl.cast(xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE], pl.BF16, mode="rint")
+                gd_x = route_input_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
                 gd_w = gate_weight[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
                 if gd_kd == 0:
                     gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
                 else:
                     gate_logits_tile = pl.matmul_acc(gate_logits_tile, gd_x, gd_w, b_trans=True)
-            # xg omitted inv_rms; logits = inv_rms * (xg @ gate_w.T).
-            gate_logits_tile = pl.row_expand_mul(gate_logits_tile, inv_rms_buf[t1 : t1 + GATE_M_TILE, 0:1])
             # Sigmoid router score: 1 / (1 + exp(-logits)).
             gp_sigmoid = pl.recip(pl.add(pl.exp(pl.neg(gate_logits_tile)), 1.0))
             route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_sigmoid
@@ -347,11 +341,11 @@ def moe_gate_test(
 
 
 def golden_moe_gate(tensors):
-    """Fill outputs in-place from the CPU router reference.
+    """Mirror the router's separate normalized and quantized input paths.
 
-    route_weights/route_indices come from the sigmoid top-k over the biased
-    scores; x_int8/x_scale are the per-token INT8 view of the normalized xg,
-    exactly what the shared expert and the EP dispatch payload consume.
+    Routing consumes BF16-rounded RMSNorm output. The INT8 branch quantizes
+    FP32 ``x * gamma`` and folds the inverse RMS into its dequantization scale,
+    matching the view consumed by shared experts and the EP dispatch payload.
     """
     from models.glm5_3_flash.quantization import quantize_per_token_int8
 
@@ -360,7 +354,11 @@ def golden_moe_gate(tensors):
     x = tensors["x"]
     x_norm = rms_norm(x, tensors["norm_weight"])
     weights, indices = gate(x_norm, tensors["gate_weight"], tensors["correction_bias"])
-    x_int8, x_scale = quantize_per_token_int8(x_norm)
+    x_f = x.float()
+    xg = x_f * tensors["norm_weight"].float()
+    inverse_rms = torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + NORM_EPS)
+    x_int8, dequant_scale = quantize_per_token_int8(xg)
+    x_scale = dequant_scale * inverse_rms
 
     tensors["route_weights"][:] = weights
     tensors["route_indices"][:] = indices
@@ -429,7 +427,8 @@ if __name__ == "__main__":
     from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--num-tokens", type=int, default=T_DYN_TEST)
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
@@ -442,7 +441,8 @@ if __name__ == "__main__":
         golden_fn=golden_moe_gate,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

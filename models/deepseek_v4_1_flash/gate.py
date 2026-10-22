@@ -34,6 +34,7 @@ N_HASH_LAYERS = 0
 
 # tiling
 GATE_T_TILE = 8
+GATE_INPUT_TILE = 8
 assert T % GATE_T_TILE == 0
 GATE_M_TILE = 16
 GATE_N_TILE = 16
@@ -119,22 +120,40 @@ def gate_normalized(
         active_tokens = pl.cast(0, pl.INDEX)
     if active_tokens > T:
         active_tokens = pl.cast(T, pl.INDEX)
-    task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
-    active_mask = pl.cast(pl.min(pl.max(num_tokens, 0), 1), pl.FP32)
-    task_gate_tiles = (task_tokens + GATE_M_TILE - 1) // GATE_M_TILE
 
     xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
-    for init_idx in pl.spmd((T_PAD // GATE_M_TILE) * (D // GATE_D_TILE), name_hint="gate_normalized_zero"):
-        init_t = (init_idx // (D // GATE_D_TILE)) * GATE_M_TILE
-        init_k = (init_idx % (D // GATE_D_TILE)) * GATE_D_TILE
-        xg_buf[init_t : init_t + GATE_M_TILE, init_k : init_k + GATE_D_TILE] = pl.full(
-            [GATE_M_TILE, GATE_D_TILE], dtype=pl.FP32, value=0.0
-        )
+    for block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="gate_normalized_input"):
+        t0 = block * GATE_INPUT_TILE
+        valid_rows = pl.min(GATE_INPUT_TILE, pl.max(active_tokens - t0, 0))
+        normalized = pl.slice(x_normed, [GATE_INPUT_TILE, D], [t0, 0], valid_shape=[valid_rows, D])
+        normalized = pl.fillpad(normalized, pad_value=pl.PadValue.zero)
+        normalized = pl.set_validshape(normalized, GATE_INPUT_TILE, D)
+        xg_buf[t0 : t0 + GATE_INPUT_TILE, :] = pl.cast(normalized, pl.FP32)
 
-    for tok in pl.spmd(task_tokens, name_hint="gate_normalized_input"):
-        normalized = pl.cast(pl.tile.load(x_normed, [tok, 0], [1, D]), pl.FP32)
-        normalized = pl.mul(normalized, active_mask)
-        pl.tile.store(normalized, [tok, 0], xg_buf, shapes=[1, D])
+    return gate_from_fp32(
+        xg_buf, gate_w, gate_bias, num_tokens,
+        x_norm_mx, x_norm_scale, indices, weights,
+    )
+
+
+@pl.jit.inline
+def gate_from_fp32(
+    xg_buf: pl.Tensor[[T_PAD, D], pl.FP32],
+    gate_w: pl.Tensor[[N_EXPERTS, D], pl.FP32],
+    gate_bias: pl.Tensor[[N_EXPERTS], pl.FP32],
+    num_tokens: pl.Scalar[pl.INT32],
+    x_norm_mx: pl.Tensor[[T_PAD, D], pl.FP8E4M3FN],
+    x_norm_scale: pl.Tensor[[1, T_PAD * MX_SCALE_GROUPS], pl.FP8E8M0],
+    indices: pl.Tensor[[T, TOPK], pl.INT32],
+    weights: pl.Tensor[[T, TOPK], pl.FP32],
+):
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    if active_tokens < 0:
+        active_tokens = pl.cast(0, pl.INDEX)
+    if active_tokens > T:
+        active_tokens = pl.cast(T, pl.INDEX)
+    task_tokens = pl.max(active_tokens, pl.cast(1, pl.INDEX))
+    task_gate_tiles = (task_tokens + GATE_M_TILE - 1) // GATE_M_TILE
 
     for quant_idx in pl.spmd((T_PAD // GATE_M_TILE) * (D // QUANT_TASK_TILE), name_hint="x_norm_mx_quant"):
         tile_idx = quant_idx // (D // QUANT_TASK_TILE)
@@ -187,19 +206,25 @@ def gate_normalized(
     route_scores_buf = pl.create_tensor([T_PAD, SCORE_PAD], dtype=pl.FP32)
     # Reserve both engines before any local Cube-to-Vector transfer.
     # Bound synchronous cohorts to the target A5 core count.
-    gate_tasks = task_gate_tiles * (N_EXPERTS // GATE_N_TILE)
-    gate_workers = pl.min(gate_tasks, 16)
+    gate_bias_matrix = pl.reshape(gate_bias, [1, N_EXPERTS])
+    gate_tasks = task_gate_tiles * ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
+    gate_workers = pl.min(gate_tasks, pl.min(16, pl.system.available_cluster_count()))
     for gate_worker in pl.spmd(gate_workers, name_hint="gate", sync_start=True):
         for gb_idx in pl.range(gate_worker, gate_tasks, gate_workers):
-            tg = gb_idx // (N_EXPERTS // GATE_N_TILE)
-            nb = gb_idx % (N_EXPERTS // GATE_N_TILE)
+            tg = gb_idx // ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
+            nb = gb_idx % ((N_EXPERTS + GATE_N_TILE - 1) // GATE_N_TILE)
             t1 = tg * GATE_M_TILE
             n0 = nb * GATE_N_TILE
             gate_logits_tile = pl.create_tensor([GATE_M_TILE, GATE_N_TILE], dtype=pl.FP32)
             for kb in pl.pipeline(0, D // GATE_D_TILE, stage=2):
                 gd_kd = kb * GATE_D_TILE
                 gd_x = xg_buf[t1 : t1 + GATE_M_TILE, gd_kd : gd_kd + GATE_D_TILE]
-                gd_w = gate_w[n0 : n0 + GATE_N_TILE, gd_kd : gd_kd + GATE_D_TILE]
+                valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
+                gd_w_raw = pl.slice(
+                    gate_w, [GATE_N_TILE, GATE_D_TILE], [n0, gd_kd], valid_shape=[valid_n, GATE_D_TILE],
+                )
+                gd_w_pad = pl.fillpad(gd_w_raw, pad_value=pl.PadValue.zero)
+                gd_w = pl.set_validshape(gd_w_pad, GATE_N_TILE, GATE_D_TILE)
                 if gd_kd == 0:
                     gate_logits_tile = pl.matmul(gd_x, gd_w, out_dtype=pl.FP32, b_trans=True)
                 else:
@@ -221,7 +246,12 @@ def gate_normalized(
             gp_softplus = pl.maximum(gp_softplus_log, gp_neg_floor)
             gp_score = pl.sqrt(gp_softplus)
             route_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_score
-            gp_bias_row = pl.reshape(gate_bias[n0 : n0 + GATE_N_TILE], [1, GATE_N_TILE])
+            bias_valid_n = pl.min(GATE_N_TILE, N_EXPERTS - n0)
+            gp_bias_raw = pl.slice(
+                gate_bias_matrix, [1, GATE_N_TILE], [0, n0], valid_shape=[1, bias_valid_n],
+            )
+            gp_bias_pad = pl.fillpad(gp_bias_raw, pad_value=pl.PadValue.min)
+            gp_bias_row = pl.set_validshape(gp_bias_pad, 1, GATE_N_TILE)
             gp_biased = pl.col_expand_add(gp_score, gp_bias_row)
             biased_scores_buf[t1 : t1 + GATE_M_TILE, n0 : n0 + GATE_N_TILE] = gp_biased
 
@@ -276,13 +306,15 @@ def gate(
     indices: pl.Tensor[[T, TOPK], pl.INT32],
     weights: pl.Tensor[[T, TOPK], pl.FP32],
 ):
-    """Keep the standalone gate ABI while making FFN RMSNorm explicit."""
-    x_normed = pl.create_tensor([T, D], dtype=pl.BF16)
-    norm_tokens = pl.tensor.dim(x_mixed, 0)
-    for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(x_mixed, norm_w, x_normed, norm_block, norm_tokens)
-    return gate_normalized(
-        x_normed, gate_w, gate_bias, num_tokens,
+    """Normalize router inputs with BF16 rounding and FP32 output."""
+    active_tokens = pl.cast(num_tokens, pl.INDEX)
+    active_tokens = pl.max(active_tokens, 0)
+    active_tokens = pl.min(active_tokens, T)
+    xg_buf = pl.create_tensor([T_PAD, D], dtype=pl.FP32)
+    for norm_block in pl.spmd(T_PAD // GATE_INPUT_TILE, name_hint="rms_norm"):
+        rms_norm_tiled(x_mixed, norm_w, xg_buf, norm_block, active_tokens, output_fp32=True)
+    return gate_from_fp32(
+        xg_buf, gate_w, gate_bias, num_tokens,
         x_norm_mx, x_norm_scale, indices, weights,
     )
 
@@ -333,11 +365,11 @@ def _golden_gate_core(tensors, x_norm, scores, biased):
 
     num_tokens = max(0, min(T, int(tensors.get("num_tokens", T))))
 
-    from quant import host_quant_mxfp8_v41, pack_mx_a_scale
+    from quant import quantize_mxfp8_upward_e8m0, pack_mx_a_scale
 
     def host_mxfp8_activation(value):
         # The released activation quantizer rounds E8M0 scales upward.
-        quantized, codes = host_quant_mxfp8_v41(value, return_e8m0=True)
+        quantized, codes = quantize_mxfp8_upward_e8m0(value)
         packed = pack_mx_a_scale(codes)
         e8m0 = getattr(torch, "float8_e8m0fnu", None)
         if e8m0 is not None:
@@ -612,13 +644,13 @@ def mxfp8_activation_value_compare(actual, expected, *, actual_outputs, expected
     """
     import torch
 
-    from quant import _e8m0_to_fp32, unpack_mx_a_scale
+    from quant import decode_e8m0, unpack_mx_a_scale
 
     def decode(outputs, payload_name):
         payload = outputs[payload_name].cpu().float()
         scale_bytes = outputs["x_norm_scale"].cpu().contiguous().view(torch.uint8)
         scale = unpack_mx_a_scale(scale_bytes.reshape(T_PAD, MX_SCALE_GROUPS))
-        scale = _e8m0_to_fp32(scale).repeat_interleave(MX_GROUP, dim=-1)
+        scale = decode_e8m0(scale).repeat_interleave(MX_GROUP, dim=-1)
         return payload * scale
 
     actual_value = decode(actual_outputs, "x_norm_mx")
@@ -637,7 +669,8 @@ if __name__ == "__main__":
     from golden.runner import run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--layer-id", type=int, default=10)
     parser.add_argument("--num-tokens", type=int, default=T)
@@ -653,7 +686,8 @@ if __name__ == "__main__":
         golden_fn=golden_gate_core,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             device_id=args.device,
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

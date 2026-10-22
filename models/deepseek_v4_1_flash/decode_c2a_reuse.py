@@ -11,6 +11,7 @@
 
 import pypto.language as pl
 import torch
+from golden import mapped_pool_ratio_allclose
 
 from decode_c2a_full import (
     build_hc_validation_values, golden_c2a_hc_case, golden_reference_c2a_reuse,
@@ -27,11 +28,11 @@ from rmsnorm import rms_norm_tiled
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
 from sparse_attention import (
     PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH,
-    gather_packed_chunk, attend_c2a_chunk, publish_window_row,
+    gather_packed_chunk, attend_c2a_chunk, publish_window_row, attend_packed_cohorts,
 )
 from o_proj import o_proj
 from golden import TensorSpec, ScalarSpec, ratio_allclose, run
-from utils import swa_window_cache_compare, AttentionGoldenResult
+from utils import AttentionGoldenResult
 
 # model config
 LOCAL_H = M.num_attention_heads // TP_SIZE
@@ -48,7 +49,6 @@ HC_DIM = M.hc_dim
 MIX_HC = M.mix_hc
 INDEX_TOPK = M.index_topk
 MX_GROUP = M.weight_block_size[0]
-
 
 
 @pl.jit.inline(auto_scope=False)
@@ -88,40 +88,53 @@ def decode_c2a_reuse(
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
+    hc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64)
     x_attn = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_pre(x_hc, pre_mix, x_attn)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd((tokens + 7) // 8, name_hint="c2a_input_norm") as cache_ready:
         worker = pl.tile.get_block_idx()
-        rms_norm_tiled(x_attn, attn_norm_weight, x_norm, worker, tokens)
+        rms_norm_tiled(x_attn, attn_norm_weight, x_norm, worker, tokens, output_fp32=False)
 
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens)
+    q_proj_rope(
+        qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens,
+        max_workers=64 if TP_SIZE == 1 else 2147483647,
+    )
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, window_kv, num_tokens)
     publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens)
 
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
-    combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
     chunk_done = cache_ready
-    for start in pl.range(0, num_tokens, QUERY_TILE):
-        active = pl.min(QUERY_TILE, num_tokens - start)
-        gather_tid = gather_packed_chunk(
-            window_cache, window_cache_scale, window_indices, compressed_cache,
-            compressed_cache_scale, compressed_indices, selected, combined, start, active,
-            chunk_done,
+    if TP_SIZE == 1 and num_tokens <= 12:
+        chunk_done = attend_packed_cohorts(
+            query, window_indices, window_cache, window_cache_scale, compressed_indices,
+            compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, chunk_done,
         )
-        chunk_done = attend_c2a_chunk(
-            query, selected, combined, attn_sink, attended, start, active, gather_tid
-        )
+    else:
+        selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
+        combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
+        for start in pl.range(0, num_tokens, QUERY_TILE):
+            active = pl.min(QUERY_TILE, num_tokens - start)
+            gather_tid = gather_packed_chunk(
+                window_cache, window_cache_scale, window_indices, compressed_cache,
+                compressed_cache_scale, compressed_indices, selected, combined, start, active,
+                chunk_done,
+            )
+            chunk_done = attend_c2a_chunk(
+                query, selected, combined, attn_sink, attended, start, active, gather_tid
+            )
 
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b,
+        wo_b_scale, rope_cos, rope_sin,
+        partial, num_tokens, grouped_max_workers=4096,
+    )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd(tokens, name_hint="c2a_output_cast"):
         row = pl.tile.get_block_idx()
@@ -324,6 +337,28 @@ def golden_decode_c2a_reuse_case(tensors):
     golden_c2a_hc_case(tensors, golden_decode_attn_c2a_reuse)
 
 
+def c2a_reuse_window_cache_compare(
+    world_size, tokens, payload_atol=0.0, payload_rtol=0.0, payload_error_ratio=0.0,
+    scale_rtol=0.0, scale_error_ratio=0.0,
+):
+    """Compare the mapped window rows and require every other row to stay unchanged."""
+    options = dict(
+        mapping_shape=(world_size, tokens),
+        block_size=128,
+        leading_rank_axis=True,
+    )
+    return {
+        "window_cache": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache",
+            atol=payload_atol, rtol=payload_rtol, max_error_ratio=payload_error_ratio, **options
+        ),
+        "window_cache_scale": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache scale",
+            atol=0.0, rtol=scale_rtol, max_error_ratio=scale_error_ratio, **options
+        ),
+    }
+
+
 if __name__ == "__main__":
     from utils import parse_decode_startpos
 
@@ -331,7 +366,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="TP1 A5 mHC C2A reuse validation")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     startpos_help = "one position per request; omitted: default validation workload"
     parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
@@ -358,7 +394,7 @@ if __name__ == "__main__":
         "output": ratio_allclose(atol=1e-2, rtol=1.0 / 128),
         "next_pre_mix": ratio_allclose(atol=2.5e-5, rtol=5e-3),
     }
-    comparisons.update(swa_window_cache_compare(
+    comparisons.update(c2a_reuse_window_cache_compare(
         1, args.tokens, payload_atol=2 ** -9, payload_rtol=2 ** -3,
     ))
     result = run(
@@ -371,7 +407,8 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         config=dict(
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=[args.device], num_sub_workers=0),

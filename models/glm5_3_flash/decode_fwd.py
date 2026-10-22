@@ -888,7 +888,8 @@ def main():
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", default="a2a3", choices=["a2a3"])
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default="0,1")
     parser.add_argument("--ep", type=int, default=EP_SIZE)
     parser.add_argument("--tp", type=int, default=TP_SIZE)
@@ -921,7 +922,7 @@ def main():
         fn=l3_decode_fwd,
         specs=build_tensor_specs(),
         golden_fn=golden_with_snapshots,
-        config=dict(platform=args.platform, dump_passes=args.dump_passes,
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, dump_passes=args.dump_passes,
                     ring_heap=[0, 512 * 1024 * 1024, 0, 0], enable_scope_stats=True,
                     distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0)),
         compile_only=args.compile_only,

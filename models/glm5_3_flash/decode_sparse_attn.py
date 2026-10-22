@@ -115,6 +115,51 @@ def golden_decode_sparse_attn(
     return torch.einsum("thw,twk->thk", weights, latent).to(absorbed_query.dtype)
 
 
+def _golden_decode_sparse_attn_impl(
+    absorbed_query: torch.Tensor,
+    latent_cache: torch.Tensor,
+    topk_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    request_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Emulate blockwise FP32 statistics and BF16 exponential PV operands.
+
+    The mathematical reference remains :func:`golden_decode_sparse_attn`.
+    """
+    output = torch.zeros_like(absorbed_query)
+    query_fp32 = absorbed_query.float()
+    heads, width = absorbed_query.shape[1:]
+    for token in range(absorbed_query.shape[0]):
+        maximum = query_fp32.new_full((heads, 1), NEG_INF)
+        denominator = torch.zeros_like(maximum)
+        numerator = query_fp32.new_zeros((heads, width))
+        for start in range(0, topk_indices.shape[1], ATTN_K_TILE):
+            positions = topk_indices.new_full((ATTN_K_TILE,), -1)
+            count = min(ATTN_K_TILE, topk_indices.shape[1] - start)
+            positions[:count] = topk_indices[token, start : start + count]
+            if positions[0] < 0:
+                continue
+            valid = positions >= 0
+            latent = latent_cache[0].float().expand(ATTN_K_TILE, width).clone()
+            rows = paged_slots(positions[valid].long(), request_ids[token].long(), block_table)
+            latent[valid] = latent_cache[rows].float()
+            scores = query_fp32[token] @ latent.T * SOFTMAX_SCALE
+            scores = scores + (~valid).float().unsqueeze(0) * NEG_INF
+            block_maximum = scores.amax(dim=-1, keepdim=True)
+            exponentials = torch.exp(scores - block_maximum)
+            block_sum = exponentials.sum(dim=-1, keepdim=True)
+            block_output = exponentials.bfloat16().float() @ latent
+            next_maximum = torch.maximum(maximum, block_maximum)
+            alpha = torch.exp(maximum - next_maximum)
+            beta = torch.exp(block_maximum - next_maximum)
+            denominator = alpha * denominator + beta * block_sum
+            numerator = alpha * numerator + beta * block_output
+            maximum = next_maximum
+        if topk_indices.shape[1] and topk_indices[token, 0] >= 0:
+            output[token] = (numerator / denominator).to(absorbed_query.dtype)
+    return output
+
+
 @pl.jit.inline
 def decode_sparse_attn(
     absorbed_query: pl.Tensor[[T_DYN, LOCAL_H, KV_LORA], pl.BF16],
@@ -149,10 +194,7 @@ def decode_sparse_attn(
     rows to use 40 of them. ``NEG_INF`` is a finite floor precisely so that
     ``NEG_INF - NEG_INF`` is 0 rather than NaN when every block of a row is skipped.
 
-    **Precondition**: every row has at least one valid lane, which
-    ``index_kpool_always_select_tail`` guarantees. An all-masked row would leave the
-    softmax denominator at ``ATTN_K_TILE`` rather than zero, so it is not defined
-    here; the reference returns a zero row for that case as a host-side convenience.
+    When every block of a row is skipped, the merge emits a zero output row.
 
     Head rows are padded to ``H_PAD`` = 16. The QK/PV matmuls are only split into L0
     tiles once M reaches the 16-row cube minimum — below it the 128x512 KV operand stays
@@ -231,7 +273,7 @@ def decode_sparse_attn(
                 mi = pl.row_max(scores)
                 weights = pl.exp(pl.row_expand_sub(scores, mi))
                 li = pl.row_sum(weights)
-                weights_bf16 = pl.cast(weights, pl.BF16, mode="rint")
+                weights_bf16 = pl.cast(weights, target_type=pl.BF16, mode="rint")
                 oi = pl.matmul(weights_bf16, kv_tile, out_dtype=pl.FP32)
                 blk_mi[blk_row : blk_row + H_PAD, 0:1] = mi
                 blk_li[blk_row : blk_row + H_PAD, 0:1] = li
@@ -297,11 +339,10 @@ def decode_sparse_attn_test(
 def build_decode_sparse_attn_specs(requests: int = 2, pages_per_request: int = 4):
     """Build one deterministic selection: ragged valid counts, padded tails.
 
-    Every row selects a different number of positions and always keeps its own tail,
-    which is what ``index_kpool_always_select_tail`` guarantees, so the ``-1`` lanes
-    and the ``SPARSE_BLOCKS`` padding are both exercised. The counts ramp past
-    ``ATTN_K_TILE`` so rows span one to four sparse blocks and the merge sees more
-    than one live partial.
+    Live rows select different numbers of positions and keep their own tail, as
+    ``index_kpool_always_select_tail`` guarantees. The final row selects nothing and
+    must produce exact zeros. Counts ramp past ``ATTN_K_TILE`` so rows span several
+    sparse blocks and the merge sees more than one live partial.
 
     Every row is front packed, which is the indexer's ABI: the ``-1`` lanes are one
     suffix per row. A fixture that interleaved them would be invalid input, not a
@@ -357,8 +398,8 @@ def build_decode_sparse_attn_specs(requests: int = 2, pages_per_request: int = 4
 
 
 def golden_decode_sparse_attn_case(tensors):
-    """Fill the expected output for :func:`build_decode_sparse_attn_specs`."""
-    tensors["output"][:] = golden_decode_sparse_attn(
+    """Fill the implementation reference for :func:`build_decode_sparse_attn_specs`."""
+    tensors["output"][:] = _golden_decode_sparse_attn_impl(
         tensors["absorbed_query"],
         tensors["latent_cache"],
         tensors["topk_indices"],
@@ -378,10 +419,11 @@ def main():
     from golden import ratio_allclose, run
     from models.glm5_3_flash._golden_smoke import run_decode_sparse_attn_golden
 
-    run_decode_sparse_attn_golden(golden_decode_sparse_attn)
+    run_decode_sparse_attn_golden(golden_decode_sparse_attn, _golden_decode_sparse_attn_impl)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--requests", type=int, default=2)
     parser.add_argument("--pages", type=int, default=4)
@@ -392,7 +434,7 @@ def main():
         fn=decode_sparse_attn_test,
         specs=build_decode_sparse_attn_specs(args.requests, args.pages),
         golden_fn=golden_decode_sparse_attn_case,
-        config={"platform": args.platform, "device_id": args.device},
+        config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
         rtol=1.0 / 64,
         atol=1e-3,
         compare_fn={"output": ratio_allclose(atol=1e-3, rtol=1.0 / 64)},

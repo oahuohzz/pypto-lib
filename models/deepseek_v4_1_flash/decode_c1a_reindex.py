@@ -45,7 +45,7 @@ from decode_indexer import c1a_index, score_reindex, select_pool_index_topk
 from hc import hc_mixes
 from hc import hc_post
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
-from sparse_attention import gather_packed, attend_selected, publish_window_row
+from sparse_attention import gather_packed, attend_selected, publish_window_row, GATHER_WORKERS, attend_packed_cohorts
 from rmsnorm import rms_norm_tiled
 from o_proj import o_proj
 
@@ -117,17 +117,17 @@ def decode_c1a_reindex(
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
+    hc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64)
     x_attn = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_pre(x_hc, pre_mix, x_attn)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd((tokens + 7) // 8, name_hint="c1a_input_norm") as x_ready:
         norm_worker = pl.tile.get_block_idx()
-        rms_norm_tiled(x_attn, attn_norm_weight, x_norm, norm_worker, tokens)
+        rms_norm_tiled(x_attn, attn_norm_weight, x_norm, norm_worker, tokens, output_fp32=False)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=64)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
@@ -146,17 +146,23 @@ def decode_c1a_reindex(
         scores, pool_block_ids, pool_block_counts, index_block_table, request_ids, compressed_lens,
         topk_indices, num_tokens, scores_tid,
     )
-    selected = pl.create_tensor([tokens, 640, HEAD_DIM], dtype=pl.BF16)
-    indices = pl.create_tensor([tokens, 640], dtype=pl.INT32)
-    selected_ret, indices_ret, gather_tid = gather_packed(
-        window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
-        window_indices, topk_indices, selected, indices, num_tokens, selection_ready,
-    )
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
+    if TP_SIZE == 1 and num_tokens <= 12:
+        attend_packed_cohorts(
+            query, window_indices, window_cache, window_cache_scale, topk_indices,
+            compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, selection_ready,
+        )
+    else:
+        selected = pl.create_tensor([tokens, 640, HEAD_DIM], dtype=pl.BF16)
+        indices = pl.create_tensor([tokens, 640], dtype=pl.INT32)
+        selected_ret, indices_ret, gather_tid = gather_packed(
+            window_cache, window_cache_scale, compressed_cache, compressed_cache_scale,
+            window_indices, topk_indices, selected, indices, num_tokens, selection_ready, max_workers=GATHER_WORKERS,
+        )
+        attend_selected(query, selected, indices, attn_sink, attended, num_tokens, gather_tid)
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
     o_proj(
-        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens,
+        attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens, grouped_max_workers=64,
     )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd(tokens, name_hint="c1a_output_cast"):
@@ -396,7 +402,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="TP1 A5 mHC C1A reindex validation")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     startpos_help = "one position per request; omitted: default validation workload"
     parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
@@ -444,7 +451,8 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         config=dict(
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             dump_passes=args.dump_passes,
             enable_chip_swimlane=args.enable_chip_swimlane,
             distributed_config=DistributedConfig(device_ids=[args.device], num_sub_workers=0),

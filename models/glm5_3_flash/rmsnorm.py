@@ -343,7 +343,8 @@ def main():
     from golden import ratio_allclose, run
 
     parser = argparse.ArgumentParser(description="GLM-5.3-Flash RMSNorm kernel validation")
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", default="a2a3", choices=["a2a3", "a5"])
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--tokens", type=int, help="token count; default covers ragged 5 and aligned 16")
     parser.add_argument("--case", choices=["all", "plain", "quant", "add"], default="all")
@@ -366,7 +367,7 @@ def main():
                 fn=fn,
                 specs=build_rmsnorm_tensor_specs(name, tokens, fixture=args.fixture),
                 golden_fn=golden_fn,
-                config=dict(platform=args.platform, device_id=args.device),
+                config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
                 compare_fn={
                     "output": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
                     "output_int8": compare_quantized,

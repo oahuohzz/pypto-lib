@@ -78,7 +78,8 @@ def main():
     from golden import TensorSpec, ratio_allclose, run
 
     parser = argparse.ArgumentParser(description="GLM-5.3-Flash BF16 linear validation")
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", default="a2a3", choices=["a2a3", "a5"])
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     args = parser.parse_args()
@@ -94,7 +95,7 @@ def main():
             TensorSpec("narrowed", [16, 128], torch.bfloat16),
         ],
         golden_fn=golden_linear,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         compile_only=args.compile_only,
         compare_fn={
             "output": ratio_allclose(atol=1e-6, rtol=1e-6, max_error_ratio=0),

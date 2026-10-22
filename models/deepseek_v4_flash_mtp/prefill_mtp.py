@@ -40,7 +40,6 @@ from prefill_moe import (
     PrefillMoELayout,
     make_prefill_moe,
     clear_prefill_moe_signals,
-    PREFILL_MOE_EXPERT_SCALE_PAD,
     PREFILL_MOE_SCALE_PAD,
     D,
     HC_DIM,
@@ -225,9 +224,6 @@ def mtp_prefill_fwd(
     moe_post_ffn = pl.create_tensor([T, HC_MULT], dtype=pl.FP32)
     moe_comb_ffn = pl.create_tensor([T, HC_MULT * HC_MULT], dtype=pl.FP32)
     moe_ffn_out = pl.create_tensor([T, D], dtype=pl.BF16)
-    moe_dense_x = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, D], dtype=pl.INT8)
-    moe_dense_scale = pl.create_tensor([PREFILL_MOE_TOTAL_CAP, PREFILL_MOE_EXPERT_SCALE_PAD], dtype=pl.FP32)
-    moe_returned_y = pl.create_tensor([PREFILL_MOE_ROUTES_PER_SRC, D], dtype=pl.BF16)
     completion = pl.create_tensor([1, 1, 8], dtype=pl.FP32)
     with pl.scope():
         with pl.at(level=pl.Level.CORE_GROUP, name_hint="mtp_prefill_attention_ready", allow_early_resolve=False) as attention_ready:
@@ -240,8 +236,6 @@ def mtp_prefill_fwd(
             shared_w1, shared_w1_scale, shared_w3, shared_w3_scale,
             shared_w2, shared_w2_scale, pre_hc_hidden_out,
             moe_x_mixed, moe_post_ffn, moe_comb_ffn, moe_ffn_out,
-            moe_dense_x, moe_dense_scale,
-            moe_returned_y,
             count_target, count_signal, x_target, x_signal,
             scale_target, reverse_target, reverse_signal,
             attention_ready, pl.cast(MTP_LAYER_ID, pl.INT32),
@@ -749,7 +743,8 @@ def golden_mtp_prefill_fwd(tensors):
 
 def main():
     parser = argparse.ArgumentParser(description="DeepSeek-V4 MTP packed-prefill forward driver.")
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a5"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument(
         "--ep", type=int, default=N_RANKS, choices=[2, 4, 8],
         help="EP world size / rank count (parsed at import by prefill_moe).",
@@ -776,6 +771,8 @@ def main():
     parser.add_argument("--dump-passes", action="store_true", default=False)
     parser.add_argument("--runtime-dir", type=str, default=None)
     args = parser.parse_args()
+    if args.execution_mode:
+        parser.error("this entry requires hardware; --sim is unsupported")
 
     print(f"[RUN] output_mode={args.output_mode}", flush=True)
 
@@ -797,7 +794,8 @@ def main():
         config=dict(
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=device_ids[:N_RANKS], num_sub_workers=0),
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_scope_stats=args.enable_scope_stats,
         ),

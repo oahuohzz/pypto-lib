@@ -41,17 +41,14 @@ from o_proj import (
     retire_prefill_signals,
     golden_o_proj, prefill_sp_output_reduce_scatter, o_proj,
 )
-from hc import prefill_sp_post, golden_hc_post
-from hc import golden_mhc_mixes
-from hc import golden_hc_pre
+from hc import golden_hc_pre, golden_hc_post, golden_mhc_mixes, prefill_sp_post
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 from rope_tables import ROPE_ROWS_DYN, materialize_rope_rows, precompute_rope_tables
 from qkv_proj_rope import golden_rope_tail, q_proj_qr, q_proj_rope, kv_proj_rope
-from quant import (
-    dequantize_mxfp4_cache, golden_bf16_gemm, golden_mxfp8_linear, golden_mxfp8_quantize, pack_mx_b_scale,
-    quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache,
-)
-from utils import paged_slots, window_metadata
+from quant import dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_grouped_mxfp8_weight, quantize_mxfp4_cache, quantize_mxfp8_cache
+from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
+from hc import HC_INPUT_NAMES, make_hc_inputs
+from utils import paged_slots, token_shards, window_metadata
 from sparse_attention import (
     PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH, gather_packed_chunk,
     prefill_attend_sparse, prefill_publish_window,
@@ -151,7 +148,7 @@ def prefill_c2a_full_attention(
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=2147483647)
     kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, window_kv, num_tokens)
     window_publish_tid = prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
 
@@ -196,7 +193,11 @@ def prefill_c2a_full_attention(
             query, selected, combined, attn_sink, attended, start, active, gather_tid
         )
 
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b,
+        wo_b_scale, rope_cos, rope_sin,
+        partial, num_tokens, grouped_max_workers=4096,
+    )
     return partial
 
 
@@ -279,13 +280,13 @@ def prefill_c2a_full_sp(
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     local_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_mixes(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix,
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
     )
     hc_collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_pre(x_hc, pre_mix, hc_collapsed)
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
     for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens)
+        rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, attn_input,
         group_base, tp_rank, num_tokens, attention_epoch,
@@ -318,16 +319,6 @@ def prefill_c2a_full_sp(
     return x_hc_out
 
 
-def golden_attention_input(
-    x_hc: torch.Tensor,
-    pre_mix: torch.Tensor,
-    attn_norm_weight: torch.Tensor,
-) -> torch.Tensor:
-    """Collapse the streams with the delayed pre-mix, round to BF16, then apply RMSNorm."""
-    return golden_rms_norm(golden_hc_pre(x_hc, pre_mix).to(torch.bfloat16), attn_norm_weight)
-
-
-HC_INPUT_NAMES = ("x_hc", "pre_mix", "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_weight")
 MX_GROUP = M.weight_block_size[0]
 
 CMP_SCALES = HEAD_DIM // 16
@@ -375,10 +366,10 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     index_heads = t["index_weights_proj"].shape[-1]
 
     # a. Query/KV projection and rotary embedding.
-    qr = golden_rms_norm(golden_mxfp8_linear(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
-    q = golden_mxfp8_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
+    qr = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
+    q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
     q = golden_rope_tail(q, t["rope_cos"], t["rope_sin"])
-    kv = golden_rms_norm(golden_mxfp8_linear(x, t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
+    kv = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
     kv = golden_rope_tail(kv, t["rope_cos"], t["rope_sin"])
 
     # b. Sliding-window cache: MXFP8, group 32, BF16 scales; addressed rows only.
@@ -439,7 +430,7 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     # e. Index keys come from the UNROTATED latent; packed FP4, group 32, E8M0, same slots.
     index_cache = t["index_cache"].clone()
     index_cache_scale = t["index_cache_scale"].clone()
-    index_key = golden_rms_norm(golden_bf16_gemm(latent, t["index_wk"]), t["index_norm_weight"])
+    index_key = golden_rms_norm(((latent).float() @ (t["index_wk"]).float()).to(torch.bfloat16), t["index_norm_weight"])
     index_key = golden_rope_tail(index_key, t["compressed_rope_cos"], t["compressed_rope_sin"])
     if compressed_rows.numel():
         payload, scale = quantize_mxfp4_cache(index_key[compressed_valid], IDX_GROUP, "e8m0")
@@ -544,7 +535,7 @@ _PREFIXES = {
 
 def _weight(gen, k, n):
     """MXFP8 input-major weight with Cube-ordered MX_B_NN scales."""
-    payload, codes = golden_mxfp8_quantize(torch.randn(n, k, generator=gen) / math.sqrt(k))
+    payload, codes = quantize_mxfp8_upward_reference(torch.randn(n, k, generator=gen) / math.sqrt(k))
     return payload.T.contiguous(), pack_mx_b_scale(codes.T.contiguous()).view(E8M0)
 
 def _plan(tokens, requests, case, mode, start_pos=None):
@@ -820,38 +811,12 @@ MODES = {
 ATTENTION_STATE = {"full": MUTABLE_NAMES + ("topk_indices",), "reuse": REUSE_MUTABLE_NAMES}
 
 
-def make_hc_inputs(tokens, seed, case):
-    """mHC inputs with distinct per-token magnitudes so both RMS statistics stay observable."""
-    gen = torch.Generator().manual_seed(seed)
-    magnitudes = (0.5 + torch.arange(tokens) % 4).reshape(-1, 1, 1)
-    # The residual stream holds BF16 values; FP32 storage only keeps hc_post's single rounding.
-    x_hc = (torch.randn(tokens, HC_MULT, D, generator=gen) * magnitudes).bfloat16().float()
-    values = {
-        "x_hc": x_hc,
-        "pre_mix": torch.sigmoid(torch.randn(tokens, HC_MULT, generator=gen)) + M.hc_eps,
-        "hc_attn_fn": torch.randn(MIX_HC, HC_DIM, generator=gen) / math.sqrt(HC_DIM),
-        "hc_attn_scale": torch.randn(3, generator=gen),
-        "hc_attn_base": torch.randn(MIX_HC, generator=gen),
-        "attn_norm_weight": (torch.randn(D, generator=gen) * 0.1 + 1).bfloat16(),
-    }
-    if case == "zero":
-        values["x_hc"] = torch.zeros_like(x_hc)
-    return values
-
-
 def make_attention_inputs(mode, tokens, requests, seed, case, *, make_inputs=None):
     """Attention fixture of the chained mode, without ``x``: the chain derives it from x_hc."""
     make = make_c2a_inputs if make_inputs is None else make_inputs
     options = {"full_rope_tables": True} if mode == "full" else {}
     values = make(tokens=tokens, requests=requests, seed=seed, case=case, mode="prefill", **options)
     return {name: value for name, value in values.items() if name != "x"}
-
-
-def token_shards(value, local_tokens):
-    """Pad scheduled rows and split them in contiguous TP rank order."""
-    padded = value.new_zeros(TP_SIZE * local_tokens, *value.shape[1:])
-    padded[:value.shape[0]].copy_(value)
-    return padded.reshape(TP_SIZE, local_tokens, *value.shape[1:])
 
 
 def reference_attention(mode, tensors, x, ranks, *, reference=golden_reference_c2a):
@@ -900,37 +865,33 @@ def reference_attention(mode, tensors, x, ranks, *, reference=golden_reference_c
     return sum(partials).bfloat16(), results
 
 
-def make_golden(mode, *, attention_reference=None, state_names=None):
-    """Reconstruct scheduled rows, evaluate full references, then shard local state."""
-
-    def golden(tensors):
-        local = tensors["x_hc"].shape[1]
-        tokens = tensors["attn_input"].shape[1]
-        for base in range(0, tensors["x_hc"].shape[0], TP_SIZE):
-            ranks = range(base, base + TP_SIZE)
-            group = slice(base, base + TP_SIZE)
-            active = int(tensors["num_tokens"][base, 0])
-            x_hc = tensors["x_hc"][group].flatten(0, 1)[:tokens].clone()
-            x_hc[active:] = 0
-            incoming = tensors["pre_mix"][group].flatten(0, 1)[:tokens]
-            pre, post, comb = golden_mhc_mixes(
-                x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base]
-            )
-            x = golden_attention_input(x_hc, incoming, tensors["attn_norm_weight"][base])
-            x[active:] = 0
-            reference = attention_reference or reference_attention
-            attention, results = reference(mode, tensors, x, ranks)
-            for rank, result in zip(ranks, results):
-                for name in ATTENTION_STATE[mode] if state_names is None else state_names:
-                    tensors[name][rank].copy_(result[name])
-            output = golden_hc_post(attention, x_hc, post, comb).float()
-            output[active:] = 0
-            pre[active:] = 0
-            tensors["attn_input"][group].copy_(x.expand_as(tensors["attn_input"][group]))
-            for name, value in (("attn_output", attention), ("next_pre_mix", pre), ("x_hc_out", output)):
-                tensors[name][group].copy_(token_shards(value, local))
-
-    return golden
+def golden_prefill_c2a(tensors, *, mode="full", reference=golden_reference_c2a):
+    """Evaluate attention and mHC outputs with per-rank cache state."""
+    local = tensors["x_hc"].shape[1]
+    tokens = tensors["attn_input"].shape[1]
+    for base in range(0, tensors["x_hc"].shape[0], TP_SIZE):
+        ranks = range(base, base + TP_SIZE)
+        group = slice(base, base + TP_SIZE)
+        active = int(tensors["num_tokens"][base, 0])
+        x_hc = tensors["x_hc"][group].flatten(0, 1)[:tokens].clone()
+        x_hc[active:] = 0
+        incoming = tensors["pre_mix"][group].flatten(0, 1)[:tokens]
+        pre, post, comb = golden_mhc_mixes(
+            x_hc, tensors["hc_attn_fn"][base], tensors["hc_attn_scale"][base], tensors["hc_attn_base"][base]
+        )
+        collapsed = golden_hc_pre(x_hc, incoming).to(torch.bfloat16)
+        x = golden_rms_norm(collapsed, tensors["attn_norm_weight"][base])
+        x[active:] = 0
+        attention, results = reference_attention(mode, tensors, x, ranks, reference=reference)
+        for rank, result in zip(ranks, results):
+            for name in ATTENTION_STATE[mode]:
+                tensors[name][rank].copy_(result[name])
+        output = golden_hc_post(attention, x_hc, post, comb).float()
+        output[active:] = 0
+        pre[active:] = 0
+        tensors["attn_input"][group].copy_(x.expand_as(tensors["attn_input"][group]))
+        for name, value in (("attn_output", attention), ("next_pre_mix", pre), ("x_hc_out", output)):
+            tensors[name][group].copy_(token_shards(value, local))
 
 
 def _report(name, actual, expected):
@@ -1113,10 +1074,10 @@ def l2_prefill_c2a_full(
     rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_rope_cos = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
     compressed_rope_sin = pl.create_tensor([tokens, ROPE_DIM // 2], dtype=pl.FP32)
-    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, active, rope_cos, rope_sin)
+    materialize_rope_rows(freqs_cos, freqs_sin, position_ids, active, rope_cos, rope_sin, False)
     materialize_rope_rows(
         compressed_freqs_cos, compressed_freqs_sin, compressed_rope_positions, active,
-        compressed_rope_cos, compressed_rope_sin,
+        compressed_rope_cos, compressed_rope_sin, False,
     )
     prefill_c2a_full_sp(
         x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight,
@@ -1349,7 +1310,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill C2A full with mHC: A5 precision")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through TP*DP-1")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2])
@@ -1384,10 +1346,11 @@ if __name__ == "__main__":
     result = run(
         fn=l3_prefill_c2a_full,
         specs=build_specs(args, "full", initial_state),
-        golden_fn=make_golden("full"),
+        golden_fn=golden_prefill_c2a,
         compile_only=args.compile_only,
         config=dict(
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
             # Full retains the K-chunk products for both compressor projections.
             ring_heap=PREFILL_C2A_FULL_RING_HEAP,

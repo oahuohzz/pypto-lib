@@ -153,7 +153,7 @@ class _Stage:
         return False
 
 
-def _normalize_config(config: Any | None) -> Any:
+def normalize_config(config: Any | None) -> Any:
     """Build the one ``RunConfig`` that drives both phases.
 
     PyPTO reads the compile half off it via ``compile_kwargs()`` and the
@@ -166,7 +166,8 @@ def _normalize_config(config: Any | None) -> Any:
     *config* is a ``dict`` of ``RunConfig`` keyword arguments, a ready
     ``RunConfig``, or ``None``. ``log_level`` is the one key that is not a
     ``RunConfig`` field: it sets the PyPTO runtime log threshold and is applied
-    here. Every other key goes straight to the constructor, so an unknown one
+    here. Target fields also accept CLI strings and simulator booleans.
+    Every other key goes straight to the constructor, so an unknown one
     is ``RunConfig``'s own ``TypeError`` naming it.
     """
     from pypto.runtime import RunConfig
@@ -175,6 +176,18 @@ def _normalize_config(config: Any | None) -> Any:
         return config if config is not None else RunConfig()
 
     fields = dict(config)
+    if isinstance(fields.get("backend_type"), str):
+        from pypto.backend import BackendType
+
+        backends = {"a2a3": BackendType.Ascend910B, "a5": BackendType.Ascend950}
+        backend = fields["backend_type"]
+        if backend not in backends:
+            raise ValueError(f"Invalid backend_type {backend!r}. Expected one of {sorted(backends)}.")
+        fields["backend_type"] = backends[backend]
+    if isinstance(fields.get("execution_mode"), bool):
+        from pypto.runtime import ExecutionMode
+
+        fields["execution_mode"] = ExecutionMode.SIM if fields["execution_mode"] else ExecutionMode.ONBOARD
     level = fields.pop("log_level", None)
     if level is not None:
         from pypto.runtime.log_config import configure_log
@@ -202,41 +215,60 @@ def _validate_stepped_swimlane(
     )
 
 
-def _stale_cpps(work_dir: Path) -> list[Path]:
-    """Return cpps under ``kernels/`` / ``orchestration/`` that need rebuilding.
+def _stale_cpps(work_dir: Path, *, platform: str) -> list[Path]:
+    """Find missing or outdated generated binaries using registered code identities.
 
-    A cpp is considered stale if **either**:
-
-    - its sibling ``.so``/``.o`` is missing entirely (binary never built or
-      removed by hand), **or**
-    - any existing sibling ``.so``/``.o`` is older than the cpp itself
-      (cpp was edited after its last build).
-
-    Both cases require a rebuild, so the caller's log line must report them
-    together.
+    Generated kernels may have several registrations sharing one content-keyed
+    binary. Require a fresh sidecar for every distinct code contract and the
+    replay platform, using PyPTO's own identity function. Plain kernels and
+    orchestration retain their legacy sibling naming. External/builtin caches
+    belong to the runtime.
     """
     stale: list[Path] = []
-    # Single-chip / L2 builds keep kernels/ + orchestration/ at the root; an L3
-    # distributed build puts one complete sub-build per rank under
-    # next_levels/{rank}/. Scan both so hand-edited L3 cpps are detected.
+    # L3 artifacts contain one complete chip build per next_levels/{rank}.
     bases = [work_dir]
     next_levels = work_dir / "next_levels"
     if next_levels.is_dir():
         bases += [d for d in sorted(next_levels.iterdir()) if d.is_dir()]
     for base in bases:
+        sidecars: dict[Path, set[tuple[Path, ...]]] = {}
+        config_path = base / "kernel_config.py"
+        if config_path.is_file():
+            from pypto.runtime._artifact_sources import read_kernel_config
+            from pypto.runtime.device_runner import (
+                _generated_cache_identity,
+                _generated_code_key,
+            )
+
+            for kernel in read_kernel_config(config_path).KERNELS:
+                source = Path(kernel["source"])
+                expected = sidecars.setdefault(source.resolve(), set())
+                if kernel.get("external", False) or kernel.get("builtin", False):
+                    # These never have source-adjacent binaries; their content
+                    # and include closure are checked by the runtime cache.
+                    continue
+                stem = source.stem
+                if _generated_code_key(kernel) is not None:
+                    stem += f"_{_generated_cache_identity(kernel)}"
+                    suffix = ".so" if platform.endswith("sim") else ".o"
+                    expected.add((source.with_name(stem + suffix),))
+                else:
+                    expected.add((source.with_name(stem + ".so"), source.with_name(stem + ".o")))
+
         for sub in ("kernels", "orchestration"):
             root = base / sub
             if not root.is_dir():
                 continue
             for cpp in root.rglob("*.cpp"):
-                siblings = [cpp.with_suffix(ext) for ext in (".so", ".o")]
-                existing = [p for p in siblings if p.exists()]
-                if not existing:
-                    stale.append(cpp)
-                    continue
+                groups = sidecars.get(cpp.resolve()) if sub == "kernels" else None
+                if groups is None:
+                    groups = {(cpp.with_suffix(".so"), cpp.with_suffix(".o"))}
                 cpp_mtime = cpp.stat().st_mtime
-                if any(p.stat().st_mtime < cpp_mtime for p in existing):
-                    stale.append(cpp)
+                for siblings in groups:
+                    existing = [p for p in siblings if p.is_file()]
+                    if not existing or any(p.stat().st_mtime < cpp_mtime for p in existing):
+                        stale.append(cpp)
+                        break
     return stale
 
 
@@ -251,9 +283,9 @@ def _format_stale_paths(stale: list[Path], work_dir: Path, max_show: int = 5) ->
     return f"{head} (+{len(rels) - max_show} more)"
 
 
-def _setup_runtime_dir(runtime_dir: str, *, compile_label: str) -> Path:
+def _setup_runtime_dir(runtime_dir: str, *, compile_label: str, platform: str) -> Path:
     """Validate *runtime_dir*; rebuild kernel cpps from edited ``.pto`` files
-    and drop cached binaries for any cpp newer than its ``.so``/``.o``.
+    and drop cached binaries when registered code has no fresh sidecar.
 
     Raises ``ValueError`` if the directory does not exist.
     """
@@ -265,7 +297,7 @@ def _setup_runtime_dir(runtime_dir: str, *, compile_label: str) -> Path:
     # mtime so the cpp -> .so check below picks them up.
     from pypto.runtime.debug.pto_rebuild import rebuild_kernel_cpp_from_pto
     rebuild_kernel_cpp_from_pto(work_dir)
-    stale = _stale_cpps(work_dir)
+    stale = _stale_cpps(work_dir, platform=platform)
     if stale:
         from pypto.runtime.debug.replay import invalidate_binary_cache
         invalidate_binary_cache(work_dir)
@@ -1506,7 +1538,7 @@ def _run_pipeline(
 
     compile_state: Any = None
     try:
-        cfg = _normalize_config(config)
+        cfg = normalize_config(config)
         _validate_unique_spec_names(specs)
         _validate_stepped_swimlane(scalar_specs, cfg)
         if data_dir is not None and not data_dir.is_dir():
@@ -1519,7 +1551,9 @@ def _run_pipeline(
     compiled: Any
     if runtime_dir is not None:
         try:
-            work_dir = _setup_runtime_dir(runtime_dir, compile_label=compile_label)
+            work_dir = _setup_runtime_dir(
+                runtime_dir, compile_label=compile_label, platform=cfg.platform,
+            )
         except ValueError as e:
             return _fail(str(e))
         # Compile was skipped, so there is no live compiled object; rebuild it
@@ -1645,9 +1679,7 @@ def _program_entry(
     def _compile(cfg: Any, _state: Any) -> Any:
         from pypto import ir
 
-        # compile_kwargs() carries the platform, which an L3 program bakes into
-        # compiled.platform at compile time: without it, incore kernels for a
-        # `-p a2a3` run would be built for the backend's default sim platform.
+        # compile_kwargs() forwards both target axes to the L2/L3 compiler.
         return ir.compile(fn, **cfg.compile_kwargs())
 
     return _compile, None, "Program compile"
@@ -1743,9 +1775,12 @@ def run(
             over *golden_fn*. With *golden_fn* None, a directory without
             ``out/`` replays the inputs alone and validation is skipped.
         config: Every setting for both phases, in one dict of
-            :class:`pypto.runtime.RunConfig` keyword arguments — ``platform``,
+            :class:`pypto.runtime.RunConfig` keyword arguments — ``backend_type``,
+            ``execution_mode``,
             ``device_id``, ``enable_chip_swimlane``, ``dump_passes``,
-            ``distributed_config``, the ``ring_*`` overrides, ... A ready
+            ``distributed_config``, the ``ring_*`` overrides, ... Target fields
+            accept chip strings (``"a2a3"`` / ``"a5"``) and simulator booleans
+            as well as PyPTO enums. A ready
             ``RunConfig`` is accepted too. PyPTO reads the compile half off
             it via ``compile_kwargs()`` and the dispatch half via
             ``run_options()`` / ``dfx_options()``, so nothing is restated per

@@ -13,6 +13,8 @@ import math
 import pypto.language as pl
 import pypto.language.distributed as pld
 import torch
+from utils import token_shards
+from golden import mapped_pool_ratio_allclose
 from sparse_attention import (
     SWA_RUN_DESCRIPTOR_WIDTH as RUN_DESCRIPTOR_WIDTH, SWA_RUN_PARTS as RUN_PARTS,
     analyze_index_runs, attend_shared_cache, decode_shared_cache_after_publish,
@@ -30,7 +32,6 @@ from rmsnorm import golden_rms_norm, rms_norm_tiled
 from qkv_proj_rope import kv_proj_rope, q_proj_qr, q_proj_rope
 from o_proj import retire_prefill_signals, o_proj, prefill_sp_output_reduce_scatter
 from prefill_cp_allgather import make_prefill_sp_input_allgather
-from utils import swa_window_cache_compare as window_cache_compare
 
 
 # model config
@@ -131,14 +132,18 @@ def prefill_swa_attention(
                 chunk_sin[row:row + 1, :] = rope_sin[source_row:source_row + 1, :]
                 chunk_indices[row:row + 1, :] = window_indices[source_row:source_row + 1, :]
         q_proj_qr(chunk_x, wq_a, wq_a_scale, q_norm_weight, qr, active)
-        q_proj_rope(qr, wq_b, wq_b_scale, chunk_cos, chunk_sin, q, active)
+        q_proj_rope(qr, wq_b, wq_b_scale, chunk_cos, chunk_sin, q, active, max_workers=2147483647)
         index_ready = analyze_index_runs(chunk_indices, descriptors, active, cache_rows)
         attend_shared_cache(
             q, decoded_cache, zero_row,
             descriptors, chunk_indices, attn_sink,
             attended, active, decoded_ready, index_ready,
         )
-        o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, chunk_cos, chunk_sin, chunk_partial, active)
+        o_proj(
+            attended, wo_a, wo_a_scale, wo_b,
+            wo_b_scale, chunk_cos, chunk_sin,
+            chunk_partial, active, grouped_max_workers=4096,
+        )
         with pl.spmd(WORKER_TILE, name_hint="prefill_swa_collect") as collect_tid:
             worker = pl.tile.get_block_idx()
             for row in pl.range(worker, active, WORKER_TILE):
@@ -195,12 +200,12 @@ def prefill_swa(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     hc_mixes(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix,
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
     )
     hc_pre(x_hc, incoming_pre_mix, collapsed)
     norm_tokens = pl.tensor.dim(collapsed, 0)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(collapsed, attn_norm_weight, local_hidden, norm_block, norm_tokens)
+        rms_norm_tiled(collapsed, attn_norm_weight, local_hidden, norm_block, norm_tokens, output_fp32=False)
     zero_bf16_padding(local_hidden, pl.min(tokens, pl.tensor.dim(local_hidden, 0)))
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, hidden,
@@ -517,13 +522,6 @@ def reference_attention(tensors, hidden, base):
     return sum(partials).bfloat16(), caches
 
 
-def token_shards(value, local_tokens):
-    """Pad a global token tensor and split it in TP rank order."""
-    padded = value.new_zeros(TP_SIZE * local_tokens, *value.shape[1:])
-    padded[:value.shape[0]].copy_(value)
-    return padded.reshape(TP_SIZE, local_tokens, *value.shape[1:])
-
-
 def golden_prefill_swa_case(tensors):
     """Reconstruct full residuals, run replicated attention, and split the reference."""
     world_size, local_tokens = tensors["x_hc"].shape[:2]
@@ -552,6 +550,28 @@ def golden_prefill_swa_case(tensors):
         tensors["output"][group].copy_(token_shards(output, local_tokens))
 
 
+def window_cache_compare(
+    world_size, tokens, payload_atol=0.0, payload_rtol=0.0, payload_error_ratio=0.0,
+    scale_rtol=0.0, scale_error_ratio=0.0,
+):
+    """Compare the mapped window rows and require every other row to stay unchanged."""
+    options = dict(
+        mapping_shape=(world_size, tokens),
+        block_size=128,
+        leading_rank_axis=True,
+    )
+    return {
+        "window_cache": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache",
+            atol=payload_atol, rtol=payload_rtol, max_error_ratio=payload_error_ratio, **options
+        ),
+        "window_cache_scale": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache scale",
+            atol=0.0, rtol=scale_rtol, max_error_ratio=scale_error_ratio, **options
+        ),
+    }
+
+
 if __name__ == "__main__":
     import argparse
     import os
@@ -560,7 +580,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill SWA + mHC: A5 precision and timing")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through TP*DP-1")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
     parser.add_argument("--ep", type=int, default=8, choices=[2, 4, 8])
@@ -606,7 +627,8 @@ if __name__ == "__main__":
         save_data=args.save_data,
         golden_data=args.golden_data,
         config=dict(
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
             enable_chip_swimlane=args.enable_chip_swimlane,
             enable_dep_gen=args.enable_dep_gen,

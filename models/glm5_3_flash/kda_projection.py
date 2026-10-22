@@ -143,12 +143,21 @@ def kda_projection(
     out_gate_flat = pl.reshape(out_gate, [t_dim, LOCAL_KDA_QKV_DIM])
     dt_bias_row = pl.reshape(dt_bias, [1, LOCAL_KDA_QKV_DIM])
     w_b_pad = pl.create_tensor([BETA_PAD, D], dtype=pl.BF16)
-    with pl.spmd(BETA_PAD, name_hint='kda_projection_b_pad') as pad_tid:
-        r = pl.tile.get_block_idx()
-        if r < LOCAL_KDA_H:
-            w_b_pad[r:r + 1, :] = w_b[r:r + 1, :]
-        else:
-            w_b_pad[r:r + 1, :] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+    # composition-compat store form, numerics unchanged: one task builds every pad
+    # row inside a pl.unroll body, so each w_b load carries a constant row offset.
+    # A plain-spmd load of a raw weight at a traced offset blocks the downstream
+    # dim folding that composed entries rely on (logs_t16/relay_m.py: s04 form
+    # poisons, s05/s12/s13 unrolled form is clean); kda_conv's unrolled weight
+    # taps are the in-tree precedent. Rows at and above LOCAL_KDA_H take the same
+    # zeros the b_zero pass used to write.
+    with pl.spmd(1, name_hint="kda_projection_b_pad") as pad_tid:
+        zero = pl.tile.get_block_idx() * 0  # single task, block index zero
+        for r in pl.unroll(BETA_PAD):
+            if r < LOCAL_KDA_H + zero:
+                w_b_pad[r : r + 1, 0:D] = pl.slice(w_b, [1, D], [r, 0])
+            else:
+                w_b_pad[r : r + 1, 0:D] = pl.full([1, D], dtype=pl.BF16, value=0.0)
+
     with pl.spmd(tiles * (LOCAL_KDA_QKV_DIM // N_TILE), name_hint='kda_projection_qkv'):
         task = pl.tile.get_block_idx()
         t0 = task // (LOCAL_KDA_QKV_DIM // N_TILE) * T_TILE
@@ -306,8 +315,8 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3",
-                        choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--case", type=str, default="ragged",
@@ -320,7 +329,7 @@ if __name__ == "__main__":
         fn=kda_projection_test,
         specs=build_tensor_specs(tokens),
         golden_fn=golden_kda_projection_tensors,
-        config=dict(platform=args.platform, device_id=args.device),
+        config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device),
         rtol=2e-2,
         atol=2e-2,
     )

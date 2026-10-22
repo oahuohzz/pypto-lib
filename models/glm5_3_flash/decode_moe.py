@@ -19,7 +19,7 @@ without a peer. The stages:
   four scalar fields (scale, weight, route id, local expert) as one 8-wide FP32
   ``remote_store`` into the destination rank's window lane ``my_rank * LANE_CAP + slot``.
 * The per-source lane count goes to ``lane_count[my_rank, 0]`` and the payload
-  barrier ``lane_ready[my_rank, 0]`` is set to the epoch, so the receiver knows both
+  counter ``lane_ready[my_rank, 0]`` is incremented once, so the receiver knows both
   how many rows arrived and that the puts retired.
 * ``moe_arrive`` waits on every peer's ``lane_ready``, then flattens its own
   window lanes source-major into the arrival arrays.
@@ -34,21 +34,21 @@ still exercises the full cursor arithmetic.
 
 Run (EP2, two ranks)::
 
-    python models/glm5_3_flash/decode_moe.py -p a2a3sim -d 0,1 --ep 2 --num-tokens 16
+    python models/glm5_3_flash/decode_moe.py -p a2a3 --sim -d 0,1 --ep 2 --num-tokens 16
     python models/glm5_3_flash/decode_moe.py -p a2a3    -d 0,1 --ep 2 --num-tokens 16
 
 Loopback (one device, no transport)::
 
-    python models/glm5_3_flash/decode_moe.py -p a2a3sim -d 0 --num-tokens 16 --loopback
+    python models/glm5_3_flash/decode_moe.py -p a2a3 --sim -d 0 --num-tokens 16 --loopback
 
 ``N_LOCAL_EXPERTS`` follows ``--ep`` (288 / 2 = 144 experts per rank in the test),
 so an EP2 run needs about 3.6 GB of INT8 weights per rank. Verified at EP2 in
 ``a2a3sim`` and on two Ascend910 dies; the EP16 acceptance run needs 16 dies.
 
-The barriers are epoch-keyed ``Set`` notifies: every rank is the single writer
-of its own signal row, and ``lane_ready[src] >= epoch`` distinguishes the current
-call from earlier notifications without clearing the signal windows. The L3
-entry repeats the same inputs twice over one set of windows with distinct epochs.
+The barriers use monotonic ``AtomicAdd(1)`` notifications: every source increments
+its slot on each peer once per phase per call. Receivers wait for the counter to
+reach the epoch without clearing the signal windows. The L3 entry repeats the
+same inputs twice over one set of windows with distinct epochs.
 
 Open items: ``T`` is the entry's decode capacity, so a 128-token production call
 raises it (and the window sizes with it); and the per-destination route scans in
@@ -104,7 +104,6 @@ def moe_pack(
     num_tokens: pl.Scalar[pl.INT32],
     num_ranks: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    epoch: pl.Scalar[pl.INT32],
 ) -> pl.Scalar[pl.TASK_ID]:
     """Push this rank's routes into the destination lanes.
 
@@ -163,12 +162,10 @@ def moe_pack(
             pl.tile.write(count_tile, [0, 0], pl.read(dst_cols, [d]))
             pld.tile.remote_store(count_tile, target=lane_count, peer=d, offsets=[my_rank, 0])
             if d != my_rank:
-                # Set, not AtomicAdd: every rank is the single writer of its own
-                # row, so the value is the epoch and no clear is needed between
-                # calls.
+                # Increment this source's counter once for the current call.
                 pld.system.notify(
                     target=lane_ready, peer=d, offsets=[my_rank, 0],
-                    value=epoch, op=pld.NotifyOp.Set,
+                    value=1, op=pld.NotifyOp.AtomicAdd,
                 )
 
     # The notify block must retire before any consumer reads this rank's own
@@ -343,16 +340,15 @@ def moe_return_notify(
     return_ready: pld.DistributedTensor[[N_RANKS, 1], pl.INT32],
     num_ranks: pl.Scalar[pl.INT32],
     my_rank: pl.Scalar[pl.INT32],
-    epoch: pl.Scalar[pl.INT32],
     return_tid: pl.Scalar[pl.TASK_ID],
 ) -> pl.Scalar[pl.TASK_ID]:
-    """Bar every peer after the return puts retire (single writer per row, Set)."""
+    """Increment every peer's return counter after the return puts retire."""
     with pl.at(level=pl.Level.CORE_GROUP, name_hint="moe_ep_return_notify", deps=[return_tid]) as sync_tid:
         for peer in pl.range(num_ranks):
             if peer != my_rank:
                 pld.system.notify(
                     target=return_ready, peer=peer, offsets=[my_rank, 0],
-                    value=epoch, op=pld.NotifyOp.Set,
+                    value=1, op=pld.NotifyOp.AtomicAdd,
                 )
     return sync_tid
 
@@ -438,7 +434,7 @@ def l2_decode_moe(
     pack_tid = moe_pack(
         route_indices, route_weights, x_int8, x_scale,
         lane_x, lane_aux, lane_count, lane_ready,
-        num_tokens, num_ranks, my_rank, epoch,
+        num_tokens, num_ranks, my_rank,
     )
     moe_arrive(
         lane_x, lane_aux, lane_count, lane_ready,
@@ -459,7 +455,7 @@ def l2_decode_moe(
         expert_out,
     )
     return_tid = moe_return(expert_out, recv_src, recv_route, slot_out, arrive_total)
-    sync_tid = moe_return_notify(return_ready, num_ranks, my_rank, epoch, return_tid)
+    sync_tid = moe_return_notify(return_ready, num_ranks, my_rank, return_tid)
     moe_combine(slot_out, return_ready, y, num_tokens, num_ranks, my_rank, epoch, sync_tid)
     return y
 
@@ -691,7 +687,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--ep", type=int, default=2, help="expert-parallel size / rank count")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
@@ -716,7 +713,8 @@ if __name__ == "__main__":
         golden_fn=golden_decode_moe,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),

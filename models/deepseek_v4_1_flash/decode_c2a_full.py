@@ -23,23 +23,19 @@ from config import (
 from compressor import publish_c2a_compressed, STATE_WIDTH, project_ratio2, compressor_ratio2, golden_compressor_ratio2_paged
 from hc import hc_mixes, golden_mhc_mixes
 from hc import hc_pre, golden_hc_pre
-from hc import hc_post, golden_hc_post
+from hc import hc_post, golden_hc_post, _hc_post_from_partial
 from rmsnorm import rms_norm_tiled, golden_rms_norm
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope, golden_rope_tail, golden_qkv_proj_rope
 from sparse_attention import (
     PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH,
-    gather_packed_chunk, attend_c2a_chunk, publish_window_row,
+    gather_packed_chunk, attend_c2a_chunk, publish_window_row, attend_packed_cohorts,
     golden_selected_attention,
 )
 from decode_indexer import decode_c2a_indexer, golden_c2a_index
 from o_proj import o_proj, golden_o_proj
 from golden import TensorSpec, ScalarSpec, ratio_allclose, mapped_pool_ratio_allclose, run
 from utils import AttentionGoldenResult, paged_slots, window_metadata
-from quant import (
-    quantize_grouped_mxfp8_weight,
-    dequantize_mxfp4_cache, golden_bf16_gemm, golden_mxfp8_quantize,
-    pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp8_cache,
-)
+from quant import quantize_grouped_mxfp8_weight, dequantize_mxfp4_cache, quantize_mxfp8_upward_reference, pack_mx_b_scale, quantize_mxfp4_cache, quantize_mxfp8_cache
 from rope_tables import precompute_rope_tables
 
 from compressor import decode_c2a_compressor_rope
@@ -126,18 +122,21 @@ def decode_c2a_full(
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
+    hc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64)
     x_attn = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_pre(x_hc, pre_mix, x_attn)
     x_norm = pl.create_tensor([tokens, D], dtype=pl.BF16)
     with pl.spmd((tokens + 7) // 8, name_hint="c2a_input_norm") as cache_ready:
         worker = pl.tile.get_block_idx()
-        rms_norm_tiled(x_attn, attn_norm_weight, x_norm, worker, tokens)
+        rms_norm_tiled(x_attn, attn_norm_weight, x_norm, worker, tokens, output_fp32=False)
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens)
+    q_proj_rope(
+        qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens,
+        max_workers=64 if TP_SIZE == 1 else 2147483647,
+    )
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, window_kv, num_tokens)
     publish_window_row(window_kv, window_slots, window_cache, window_cache_scale, num_tokens)
@@ -167,29 +166,42 @@ def decode_c2a_full(
     )
 
     attended = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-    selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
-    combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
     chunk_done = pl.system.task_dummy(deps=[select_tid, state_tid, compressed_publish_tid])
-    for start in pl.range(0, num_tokens, QUERY_TILE):
-        active = pl.min(QUERY_TILE, num_tokens - start)
-        gather_tid = gather_packed_chunk(
-            window_cache, window_cache_scale, window_indices, compressed_cache,
-            compressed_cache_scale, topk_indices, selected, combined, start, active, chunk_done,
+    if TP_SIZE == 1 and num_tokens <= 12:
+        chunk_done = attend_packed_cohorts(
+            query, window_indices, window_cache, window_cache_scale, topk_indices,
+            compressed_cache, compressed_cache_scale, attn_sink, attended, num_tokens, chunk_done,
         )
-        chunk_done = attend_c2a_chunk(query, selected, combined, attn_sink, attended, start, active, gather_tid)
+    else:
+        selected = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH, HEAD_DIM], dtype=pl.BF16)
+        combined = pl.create_tensor([QUERY_TILE, SPARSE_WIDTH], dtype=pl.INT32)
+        for start in pl.range(0, num_tokens, QUERY_TILE):
+            active = pl.min(QUERY_TILE, num_tokens - start)
+            gather_tid = gather_packed_chunk(
+                window_cache, window_cache_scale, window_indices, compressed_cache,
+                compressed_cache_scale, topk_indices, selected, combined, start, active, chunk_done,
+            )
+            chunk_done = attend_c2a_chunk(query, selected, combined, attn_sink, attended, start, active, gather_tid)
 
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b,
+        wo_b_scale, rope_cos, rope_sin,
+        partial, num_tokens, grouped_max_workers=4096,
+    )
     attn_out = pl.create_tensor([tokens, D], dtype=pl.BF16)
-    with pl.spmd(tokens, name_hint="c2a_output_cast"):
-        row = pl.tile.get_block_idx()
-        for col in pl.range(0, D, 512):
-            value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
-            if row < num_tokens:
-                partial_tile = pl.load(partial, [row, col], [1, 512])
-                value = pl.cast(partial_tile, pl.BF16, mode="rint")
-            pl.store(value, [row, col], attn_out)
-    hc_post(attn_out, x_hc, post_mix, residual_mix, output)
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
+        _hc_post_from_partial(partial, attn_out, x_hc, post_mix, residual_mix, output, num_tokens)
+    else:
+        with pl.spmd(tokens, name_hint="c2a_output_cast"):
+            row = pl.tile.get_block_idx()
+            for col in pl.range(0, D, 512):
+                value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
+                if row < num_tokens:
+                    partial_tile = pl.load(partial, [row, col], [1, 512])
+                    value = pl.cast(partial_tile, pl.BF16, mode="rint")
+                pl.store(value, [row, col], attn_out)
+        hc_post(attn_out, x_hc, post_mix, residual_mix, output)
     return output, next_pre_mix
 
 
@@ -489,7 +501,7 @@ def golden_reference_c2a(inputs: dict, *, fp32_output=False) -> dict:
     # Publish RNE E2M1 index keys with group-32 E8M0 scales.
     index_cache = t["index_cache"].clone()
     index_cache_scale = t["index_cache_scale"].clone()
-    index_key = golden_rms_norm(golden_bf16_gemm(latent, t["index_wk"]), t["index_norm_weight"])
+    index_key = golden_rms_norm(((latent).float() @ (t["index_wk"]).float()).to(torch.bfloat16), t["index_norm_weight"])
     index_key = golden_rope_tail(index_key, t["compressed_rope_cos"], t["compressed_rope_sin"])
     if compressed_rows.numel():
         payload, scale = quantize_mxfp4_cache(index_key[compressed_valid], IDX_GROUP, "e8m0", round_to_even=True)
@@ -585,7 +597,7 @@ _PREFIXES = {
 
 def _weight(gen, k, n):
     """MXFP8 input-major weight with Cube-ordered MX_B_NN scales."""
-    payload, codes = golden_mxfp8_quantize(torch.randn(n, k, generator=gen) / math.sqrt(k))
+    payload, codes = quantize_mxfp8_upward_reference(torch.randn(n, k, generator=gen) / math.sqrt(k))
     return payload.T.contiguous(), pack_mx_b_scale(codes.T.contiguous()).view(E8M0)
 
 
@@ -960,7 +972,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="TP1 A5 mHC C2A full validation")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     startpos_help = "one position per request; omitted: default validation workload"
     parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
@@ -1002,7 +1015,8 @@ if __name__ == "__main__":
         golden_data=args.golden_data,
         runtime_dir=args.runtime_dir,
         config=dict(
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             enable_chip_swimlane=args.enable_chip_swimlane,
             dump_passes=args.dump_passes,
             distributed_config=DistributedConfig(device_ids=[args.device], num_sub_workers=0),

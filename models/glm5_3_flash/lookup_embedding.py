@@ -6,17 +6,13 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Vocab-parallel embedding lookup, and the mHC stream seed.
+"""Look up one vocabulary shard and replicate BF16 embeddings into mHC streams."""
 
-``vocab_size = 154880`` over TP16 gives 9680 rows per rank; a token whose id falls
-outside the rank's shard contributes zero and the all-reduce completes it. The
-embedding table is never quantized.
+import sys
+from pathlib import Path
 
-The result is immediately replicated into the four hyper-connection streams
-(``inputs_embeds.unsqueeze(2).expand(-1, -1, 4, -1)``), so this kernel can emit the
-``[T, 4, D]`` stream directly and save a copy — but note the stream is BF16, so the
-replication is a view-shaped broadcast, not a cast.
-"""
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pypto.language as pl
 import torch
@@ -24,12 +20,8 @@ import torch
 from models.glm5_3_flash.config import D, HC_MULT, LOCAL_VOCAB, T_DYN
 
 
-def golden_lookup_embedding(
-    token_ids: torch.Tensor,
-    table: torch.Tensor,
-    vocab_start: int,
-) -> torch.Tensor:
-    raise NotImplementedError("embedding golden is assigned with the kernel")
+# tiling
+D_TILE = 1024
 
 
 @pl.jit.inline
@@ -39,7 +31,38 @@ def lookup_embedding(
     vocab_start: pl.Scalar[pl.INT32],
     hidden_streams: pl.Tensor[[T_DYN, HC_MULT, D], pl.BF16],
 ):
-    raise NotImplementedError("embedding kernel body is assigned independently")
+    """Write local-shard rows or zeros; the caller reduces across vocabulary shards."""
+    token_count = pl.tensor.dim(token_ids, 0)
+    streams_flat = pl.reshape(hidden_streams, [token_count * HC_MULT, D])
+    vocab_stop = vocab_start + LOCAL_VOCAB
+    for block in pl.spmd(48, name_hint="lookup_embedding"):
+        for work in pl.range(block, token_count * (D // D_TILE), 48):
+            token = work // (D // D_TILE)
+            hidden_offset = (work % (D // D_TILE)) * D_TILE
+            token_id = pl.read(token_ids, [token])
+            chunk = pl.full([1, D_TILE], dtype=pl.BF16, value=0.0)
+            if token_id >= vocab_start:
+                if token_id < vocab_stop:
+                    local_id = pl.cast(token_id - vocab_start, pl.INDEX)
+                    chunk = table[local_id : local_id + 1, hidden_offset : hidden_offset + D_TILE]
+            for stream in pl.range(HC_MULT):
+                row = token * HC_MULT + stream
+                streams_flat[row : row + 1, hidden_offset : hidden_offset + D_TILE] = chunk
+    return hidden_streams
+
+
+def golden_lookup_embedding(
+    token_ids: torch.Tensor,
+    table: torch.Tensor,
+    vocab_start: int,
+) -> torch.Tensor:
+    """Return replicated local-shard rows with exact zeros for nonlocal IDs."""
+    local_ids = token_ids.to(torch.int64) - int(vocab_start)
+    local = (local_ids >= 0) & (local_ids < table.shape[0])
+    output = torch.zeros(token_ids.numel(), HC_MULT, D, dtype=table.dtype, device=table.device)
+    rows = table.index_select(0, local_ids[local])
+    output[local] = rows.unsqueeze(1).expand(-1, HC_MULT, -1)
+    return output
 
 
 __all__ = [

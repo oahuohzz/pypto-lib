@@ -85,10 +85,11 @@ def dense_mlp(
         h_fp32 = pl.create_tensor([DN_M_TILE, LOCAL_DENSE_INTER], dtype=pl.FP32)
         h_i8 = pl.create_tensor([DN_M_TILE, LOCAL_DENSE_INTER], dtype=pl.INT8)
         h_scale_dq = pl.create_tensor([DN_M_TILE, DN_ROW_PAD], dtype=pl.FP32, manual_dep=True)
-        with pl.at(level=pl.Level.CORE_GROUP, name_hint='dn_h_i8_init'):
-            for col in pl.range(0, LOCAL_DENSE_INTER, QUANT_TILE):
-                zero = pl.full([DN_M_TILE, QUANT_TILE], dtype=pl.FP16, value=0.0)
-                h_i8[:, col:col + QUANT_TILE] = pl.cast(zero, target_type=pl.INT8, mode='trunc')
+        with pl.at(level=pl.Level.CORE_GROUP, name_hint="dn_h_i8_init"):
+            for init_k0 in pl.pipeline(0, LOCAL_DENSE_INTER, QUANT_TILE, stage=1):
+                zero_fp16 = pl.full([DN_M_TILE, QUANT_TILE], dtype=pl.FP16, value=0.0)
+                zero_i8 = pl.cast(zero_fp16, target_type=pl.INT8, mode="trunc")
+                h_i8[:, init_k0 : init_k0 + QUANT_TILE] = zero_i8
         n_act_blocks = (valid_rows + DN_ROWS_PER_BLOCK - 1) // DN_ROWS_PER_BLOCK
         for row_block in pl.spmd(n_act_blocks, name_hint='dn_gate_up_act_q'):
             row0 = row_block * DN_ROWS_PER_BLOCK
@@ -144,11 +145,21 @@ def dense_mlp(
             d0 = db_idx * D_OUT_TILE
             y_acc = pl.create_tensor([DN_M_TILE, D_OUT_TILE], dtype=pl.INT32)
             for k0 in pl.pipeline(0, LOCAL_DENSE_INTER, INTER_K, stage=2):
-                hs_k = h_i8[:, k0:k0 + INTER_K]
-                sw2_k = w_down[d0:d0 + D_OUT_TILE, k0:k0 + INTER_K]
-                y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True, init_cond=k0 == 0)
-            y_i32[:, d0:d0 + D_OUT_TILE] = y_acc
-        for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint='dn_w2_act', allow_early_resolve=True):
+                # composition-compat load form, numerics unchanged: the operand
+                # reads h_i8 through a reshape view of the same buffer. A row-open
+                # (``[:, k]``) getitem directly on the create inside this
+                # spmd+pipeline body blocks dim folding for ForStmt boundaries
+                # elsewhere in a composed entry (probe: d0 poisoned; d7 without
+                # this region and d10 with the view both compile); kda_output
+                # already routes its create reads the same way.
+                h_i8_view = pl.reshape(h_i8, [DN_M_TILE, LOCAL_DENSE_INTER])
+                hs_k = h_i8_view[:, k0 : k0 + INTER_K]
+                sw2_k = w_down[d0 : d0 + D_OUT_TILE, k0 : k0 + INTER_K]
+                y_acc = pl.matmul_acc(y_acc, hs_k, sw2_k, b_trans=True, init_cond=(k0 == 0))
+            y_i32[:, d0 : d0 + D_OUT_TILE] = y_acc
+
+        # Dequant w2 output (per-row h scale x per-channel w2 scale) -> FP32.
+        for db_idx in pl.spmd(D // (W2_ACT_INNER * D_OUT_TILE_ACT), name_hint="dn_w2_act", allow_early_resolve=True):
             d_base = db_idx * (W2_ACT_INNER * D_OUT_TILE_ACT)
             h_scale = pl.row_max(h_scale_dq[:, :])
             for dg in pl.pipeline(W2_ACT_INNER, stage=2):
@@ -397,7 +408,8 @@ if __name__ == "__main__":
     from golden import ratio_allclose, ratio_reldiff, run
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--num-tokens", type=int)
     parser.add_argument("--dtype", choices=["int8", "bf16"], default="int8")
@@ -422,7 +434,7 @@ if __name__ == "__main__":
                 fn=dense_mlp_bf16_test,
                 specs=build_bf16_tensor_specs(count, weights=args.weights, tp_rank=args.tp_rank),
                 golden_fn=golden_dense_mlp_bf16_fn,
-                config=dict(platform=args.platform, device_id=args.device, dump_passes=args.dump_passes),
+                config=dict(backend_type=args.backend_type, execution_mode=args.execution_mode, device_id=args.device, dump_passes=args.dump_passes),
                 compile_only=args.compile_only,
                 compare_fn={"output": ratio_allclose(atol=0.02, rtol=0.02, max_error_ratio=0)},
             )
@@ -441,7 +453,7 @@ if __name__ == "__main__":
             golden_fn=golden_dense_mlp_fn,
             config=dict(
                 dump_passes=args.dump_passes,
-                platform=args.platform,
+                backend_type=args.backend_type, execution_mode=args.execution_mode,
                 device_id=args.device,
                 enable_chip_swimlane=args.enable_chip_swimlane,
             ),

@@ -28,11 +28,10 @@ from sparse_attention import (
     attend_packed, golden_compressed_attention, golden_prefill_c1a_attention,
     prefill_publish_window,
 )
-from utils import (
-    CASE_DEFAULT, CASE_MAX_TOKENS, CASE_NAMES, apply_distributed_golden, fixture_token_count,
-    make_fixture_values, topk_indices_compare, wrap_attention_compare,
-    AttentionGoldenResult, COMMON_INPUT_NAMES,
+from prefill_c1a_full import (
+    CASE_DEFAULT, CASE_MAX_TOKENS, CASE_NAMES, apply_distributed_golden, fixture_token_count, make_fixture_values, topk_indices_compare, wrap_attention_compare, COMMON_INPUT_NAMES,
 )
+from utils import AttentionGoldenResult
 from prefill_cp_allgather import prefill_sp_input_allgather
 from o_proj import retire_prefill_signals, prefill_sp_output_reduce_scatter, o_proj, prefill_tp_output_all_reduce
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
@@ -138,9 +137,8 @@ def prefill_c1a_reindex_attention(
             rope_cos, rope_sin, index_wq_b, index_wq_b_scale, index_weights_proj,
             pool_block_ids, pool_block_counts, topk_indices, num_tokens, cache_ready, pool=use_candidates, c2a=False,
         )
-        tokens = pl.tensor.dim(x, 0)
         query = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
-        q_proj_rope(query_latent, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens)
+        q_proj_rope(query_latent, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=2147483647)
         window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
         kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, window_kv, num_tokens)
@@ -159,7 +157,7 @@ def prefill_c1a_reindex_attention(
         o_proj(
             attended, wo_a, wo_a_scale, wo_b,
             wo_b_scale, rope_cos, rope_sin,
-            partial, num_tokens,
+            partial, num_tokens, grouped_max_workers=4096,
         )
     if scatter_output:
         prefill_sp_output_reduce_scatter(
@@ -327,13 +325,13 @@ def l2_prefill_c1a_reindex_sharded(
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     local_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_mixes(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix,
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
     )
     hc_collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_pre(x_hc, pre_mix, hc_collapsed)
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
     for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens)
+        rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, attn_input, rank // TP_SIZE * TP_SIZE, rank % TP_SIZE,
         active, attention_epoch,
@@ -535,11 +533,11 @@ def prefill_c1a_reindex(
     tokens = pl.tensor.dim(x_hc, 0)
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
-    hc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix)
+    hc_mixes(x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64)
     hc_pre(x_hc, pre_mix, hidden)
     norm_tokens = pl.tensor.dim(hidden, 0)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(hidden, attn_norm_weight, attn_input, norm_block, norm_tokens)
+        rms_norm_tiled(hidden, attn_norm_weight, attn_input, norm_block, norm_tokens, output_fp32=False)
     prefill_c1a_reindex_attention(
         attn_input, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale,
         kv_norm_weight, attn_sink, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin,
@@ -796,7 +794,8 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill C1A reindex with mHC validation")
-    parser.add_argument("-p", "--platform", default="a5", choices=("a5", "a5sim"))
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=None)
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=(1, 2, 4))
     parser.add_argument("--seed", type=int, default=17)
@@ -841,7 +840,7 @@ if __name__ == "__main__":
         compile_only=args.compile_only,
         runtime_dir=args.runtime_dir,
         config={
-            "platform": args.platform,
+            "backend_type": args.backend_type, "execution_mode": args.execution_mode,
             "distributed_config": DistributedConfig(device_ids=devices, num_sub_workers=0),
             "dump_passes": args.dump_passes,
             "enable_chip_swimlane": args.enable_chip_swimlane,

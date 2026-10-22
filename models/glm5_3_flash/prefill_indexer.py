@@ -922,7 +922,8 @@ def main():
     _self_check()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", default="a2a3", choices=["a2a3", "a2a3sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument(
@@ -1108,7 +1109,7 @@ def main():
             run(
                 fn=indexer_proj_test,
                 specs=build_indexer_proj_specs(args.tokens),
-                config={"platform": args.platform, "device_id": args.device},
+                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                 compile_only=args.compile_only,
                 **extra,
             )
@@ -1134,7 +1135,7 @@ def main():
             run(
                 fn=indexer_score_test,
                 specs=specs,
-                config={"platform": args.platform, "device_id": args.device},
+                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                 compile_only=args.compile_only,
                 **extra,
             )
@@ -1155,7 +1156,7 @@ def main():
                     compare_fn={
                         "index_scores": score_window_compare,
                     },
-                    config={"platform": args.platform, "device_id": args.device},
+                    config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                     compile_only=args.compile_only,
                 )
             )
@@ -1179,7 +1180,7 @@ def main():
             run(
                 fn=indexer_topk_test,
                 specs=specs,
-                config={"platform": args.platform, "device_id": args.device},
+                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                 compile_only=args.compile_only,
                 **extra,
             )
@@ -1202,7 +1203,7 @@ def main():
             run(
                 fn=indexer_expand_test,
                 specs=specs,
-                config={"platform": args.platform, "device_id": args.device},
+                config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                 compile_only=args.compile_only,
                 **extra,
             )
@@ -1252,7 +1253,7 @@ def main():
                 run(
                     fn=indexer_prefill_step_test,
                     specs=specs,
-                    config={"platform": args.platform, "device_id": args.device},
+                    config={"backend_type": args.backend_type, "execution_mode": args.execution_mode, "device_id": args.device},
                     compile_only=args.compile_only,
                     **extra,
                 )

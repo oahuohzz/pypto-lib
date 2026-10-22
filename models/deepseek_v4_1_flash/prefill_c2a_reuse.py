@@ -28,14 +28,15 @@ from o_proj import (
 from hc import prefill_sp_post, hc_post
 from prefill_c2a_full import (
     CMP_PACKED, CMP_SCALES, REUSE_INPUT_NAMES, make_c2a_inputs, golden_reference_c2a,
-    reference_attention, _flat_cache_rows, _write_rows, MX_GROUP, CMP_GROUP, ATTEND_TILE,
+    _flat_cache_rows, _write_rows, MX_GROUP, CMP_GROUP, ATTEND_TILE,
 )
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope, golden_rope_tail
 from sparse_attention import (
     PACKED_QUERY_TILE as QUERY_TILE, SELECTED_KEYS as SPARSE_WIDTH, gather_packed_chunk,
     prefill_attend_sparse, prefill_publish_window,
 )
-from quant import golden_mxfp8_linear, quantize_mxfp8_cache
+from gemm import golden_gemm_bf16_via_mxfp8_to_bf16_sequential
+from quant import quantize_mxfp8_cache
 from rmsnorm import golden_rms_norm, rms_norm_tiled
 
 
@@ -103,7 +104,7 @@ def prefill_c2a_reuse_attention(
     window_kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, query, num_tokens, max_workers=2147483647)
     kv_proj_rope(x, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, window_kv, num_tokens)
     prefill_publish_window(window_kv, window_slots, window_cache, window_cache_scale, num_tokens, cache_ready)
 
@@ -122,7 +123,11 @@ def prefill_c2a_reuse_attention(
             query, selected, combined, attn_sink, attended, start, active, gather_tid
         )
 
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b,
+        wo_b_scale, rope_cos, rope_sin,
+        partial, num_tokens, grouped_max_workers=4096,
+    )
     return partial
 
 
@@ -177,13 +182,13 @@ def prefill_c2a_reuse_sp(
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     local_hidden = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_mixes(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix,
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
     )
     hc_collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_pre(x_hc, pre_mix, hc_collapsed)
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
     for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens)
+        rms_norm_tiled(hc_collapsed, attn_norm_weight, local_hidden, hc_norm_block, hc_norm_tokens, output_fp32=False)
     prefill_sp_input_allgather(
         local_hidden, input_window, input_arrived, attn_input,
         group_base, tp_rank, num_tokens, attention_epoch,
@@ -257,13 +262,13 @@ def prefill_c2a_reuse(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     hc_mixes(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix,
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, next_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
     )
     hc_collapsed = pl.create_tensor([tokens, D], dtype=pl.BF16)
     hc_pre(x_hc, pre_mix, hc_collapsed)
     hc_norm_tokens = pl.tensor.dim(hc_collapsed, 0)
     for hc_norm_block in pl.spmd((hc_norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(hc_collapsed, attn_norm_weight, attn_input, hc_norm_block, hc_norm_tokens)
+        rms_norm_tiled(hc_collapsed, attn_norm_weight, attn_input, hc_norm_block, hc_norm_tokens, output_fp32=False)
     attention_tokens = pl.tensor.dim(attn_input, 0)
     attention_partial = pl.create_tensor([attention_tokens, D], dtype=pl.FP32)
     prefill_c2a_reuse_attention(
@@ -432,10 +437,10 @@ def golden_reference_c2a_reuse(inputs: dict, *, fp32_output=False) -> dict:
     head_dim = t["window_cache"].shape[-1]
     local_heads = t["attn_sink"].numel()
 
-    qr = golden_rms_norm(golden_mxfp8_linear(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
-    q = golden_mxfp8_linear(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
+    qr = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, t["wq_a"], t["wq_a_scale"]), t["q_norm_weight"])
+    q = golden_gemm_bf16_via_mxfp8_to_bf16_sequential(qr, t["wq_b"], t["wq_b_scale"]).unflatten(-1, (local_heads, head_dim))
     q = golden_rope_tail(q, t["rope_cos"], t["rope_sin"])
-    kv = golden_rms_norm(golden_mxfp8_linear(x, t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
+    kv = golden_rms_norm(golden_gemm_bf16_via_mxfp8_to_bf16_sequential(x, t["wkv"], t["wkv_scale"]), t["kv_norm_weight"])
     kv = golden_rope_tail(kv, t["rope_cos"], t["rope_sin"])
 
     window_cache = t["window_cache"].clone()
@@ -532,11 +537,12 @@ if __name__ == "__main__":
 
     from config import MAX_BATCH_PER_DP
     from golden import run
-    from prefill_c2a_full import PREFILL_ATTN_RING_HEAP, build_specs, make_compare, make_golden
+    from prefill_c2a_full import PREFILL_ATTN_RING_HEAP, golden_prefill_c2a, build_specs, make_compare
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 prefill C2A reuse with mHC: A5 precision")
-    parser.add_argument("-p", "--platform", default="a5", choices=["a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", default=None, help="comma-separated device IDs; default: 0 through TP*DP-1")
     parser.add_argument("--tp", type=int, default=TP_SIZE, choices=[1, 2, 4])
     parser.add_argument("--dp", type=int, default=1, choices=[1, 2])
@@ -571,10 +577,11 @@ if __name__ == "__main__":
     result = run(
         fn=l3_prefill_c2a_reuse,
         specs=build_specs(args, "reuse", initial_state, make_inputs=make_c2a_reuse_inputs),
-        golden_fn=make_golden("reuse", attention_reference=functools.partial(reference_attention, reference=golden_reference_c2a_reuse)),
+        golden_fn=functools.partial(golden_prefill_c2a, mode="reuse", reference=golden_reference_c2a_reuse),
         compile_only=args.compile_only,
         config=dict(
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             distributed_config=DistributedConfig(device_ids=devices, num_sub_workers=0),
             ring_heap=PREFILL_ATTN_RING_HEAP,
         ),

@@ -9,7 +9,10 @@
 """SWA decode Attention half-layer composition entry."""
 
 
+from dataclasses import replace
+from golden import ScalarSpec, TensorSpec
 import torch
+from golden import mapped_pool_ratio_allclose
 
 import pypto.language as pl
 
@@ -31,14 +34,10 @@ from sparse_attention import publish_window_row
 from qkv_proj_rope import q_proj_qr, q_proj_rope, kv_proj_rope
 from sparse_attention import swa_attention_partial
 from o_proj import o_proj
-from utils import (
-    assemble_specs,
-    swa_window_cache_compare as window_cache_compare,
-)
 from hc import hc_pre, zero_bf16_padding, golden_hc_pre
 from hc import golden_mhc_mixes, hc_mixes
 from rmsnorm import golden_rms_norm, rms_norm_tiled
-from hc import golden_hc_post, hc_post
+from hc import golden_hc_post, hc_post, _hc_post_from_partial
 
 
 # model config
@@ -56,6 +55,8 @@ HC_DIM = M.hc_dim
 MIX_HC = M.mix_hc
 MX_GROUP = M.weight_block_size[0]
 
+# Tiling.
+Q_ROPE_WORKER_TILE = 64 if TP_SIZE == 1 else 2147483647
 
 
 @pl.jit.inline(auto_scope=False)
@@ -97,18 +98,18 @@ def decode_swa(
     post_mix = pl.create_tensor([tokens, HC_MULT], dtype=pl.FP32)
     residual_mix = pl.create_tensor([tokens, HC_MULT, HC_MULT], dtype=pl.FP32)
     hc_mixes(
-        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix,
+        x_hc, hc_attn_fn, hc_attn_scale, hc_attn_base, attention_pre_mix, post_mix, residual_mix, sinkhorn_blocks=64,
     )
     hc_pre(x_hc, incoming_pre_mix, x_attn)
     norm_tokens = pl.tensor.dim(x_attn, 0)
     for norm_block in pl.spmd((norm_tokens + 7) // 8, name_hint="rms_norm"):
-        rms_norm_tiled(x_attn, attn_norm_weight, x_norm, norm_block, norm_tokens)
+        rms_norm_tiled(x_attn, attn_norm_weight, x_norm, norm_block, norm_tokens, output_fp32=False)
     zero_bf16_padding(x_norm, pl.min(num_tokens, pl.tensor.dim(x_norm, 0)))
     qr = pl.create_tensor([tokens, Q_LORA], dtype=pl.BF16)
     q = pl.create_tensor([tokens, LOCAL_H * HEAD_DIM], dtype=pl.BF16)
     kv = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     q_proj_qr(x_norm, wq_a, wq_a_scale, q_norm_weight, qr, num_tokens)
-    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens)
+    q_proj_rope(qr, wq_b, wq_b_scale, rope_cos, rope_sin, q, num_tokens, max_workers=Q_ROPE_WORKER_TILE)
     kv_projection = pl.create_tensor([tokens, HEAD_DIM], dtype=pl.BF16)
     kv_proj_rope(x_norm, wkv, wkv_scale, kv_norm_weight, rope_cos, rope_sin, kv_projection, kv, num_tokens)
     publish_window_row(kv, window_slots, window_cache, window_cache_scale, num_tokens)
@@ -117,16 +118,23 @@ def decode_swa(
         q, window_cache, window_cache_scale, window_indices, attn_sink, attended, num_tokens,
     )
     partial = pl.create_tensor([tokens, D], dtype=pl.FP32)
-    o_proj(attended, wo_a, wo_a_scale, wo_b, wo_b_scale, rope_cos, rope_sin, partial, num_tokens)
+    o_proj(
+        attended, wo_a, wo_a_scale, wo_b,
+        wo_b_scale, rope_cos, rope_sin,
+        partial, num_tokens, grouped_max_workers=4096,
+    )
     output_rows = pl.tensor.dim(attention_output, 0)
-    for row in pl.spmd(output_rows, name_hint="swa_output_cast"):
-        for col in pl.range(0, D, 512):
-            value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
-            if row < num_tokens:
-                partial_tile = pl.load(partial, [row, col], [1, 512])
-                value = pl.cast(partial_tile, pl.BF16, mode="rint")
-            attention_output = pl.store(value, [row, col], attention_output)
-    hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden)
+    if TP_SIZE == 1 and num_tokens > 0 and num_tokens <= 16:
+        _hc_post_from_partial(partial, attention_output, x_hc, post_mix, residual_mix, attention_hidden, num_tokens)
+    else:
+        for row in pl.spmd(output_rows, name_hint="swa_output_cast"):
+            for col in pl.range(0, D, 512):
+                value = pl.tile.full([1, 512], dtype=pl.BF16, value=0.0)
+                if row < num_tokens:
+                    partial_tile = pl.load(partial, [row, col], [1, 512])
+                    value = pl.cast(partial_tile, pl.BF16, mode="rint")
+                attention_output = pl.store(value, [row, col], attention_output)
+        hc_post(attention_output, x_hc, post_mix, residual_mix, attention_hidden)
     return attention_hidden, attention_pre_mix
 
 
@@ -255,6 +263,89 @@ def l3_decode_swa(
     )
 
 
+SCALAR_NAMES = ("num_tokens", "attention_epoch")
+
+
+def make_boundary_specs(args):
+    """Create local mHC token slabs, full attention gather storage, and runtime scalars."""
+    # Keep one uniform physical slab per rank.  The last rank(s) may contain
+    # padding when the active token count is not divisible by TP; the runtime
+    # scalar ``num_tokens`` and the collectives' first/count calculation keep
+    # those rows out of the gather and reduce-scatter.
+    local = getattr(args, "local_tokens", (args.tokens + args.tp - 1) // args.tp)
+    generator = torch.Generator().manual_seed(args.seed + 1000)
+    specs = []
+    shapes = {
+        "x_hc": [local, HC_MULT, D],
+        "incoming_pre_mix": [local, HC_MULT],
+        "hc_attn_fn": [MIX_HC, HC_DIM],
+        "hc_attn_scale": [3],
+        "hc_attn_base": [MIX_HC],
+        "attn_norm_weight": [D],
+    }
+    for name, shape in shapes.items():
+        value = torch.randn(shape, generator=generator)
+        if name == "hc_attn_fn":
+            value /= HC_DIM**0.5
+        elif name == "attn_norm_weight":
+            value = torch.ones(shape, dtype=torch.bfloat16)
+        elif name == "incoming_pre_mix":
+            value = torch.softmax(value, dim=-1)
+        if name in ("x_hc", "incoming_pre_mix"):
+            # Sequence-parallel ranks own different slices of the batch, so the token
+            # inputs must differ per rank: with replicated values a gather or
+            # ReduceScatter that mis-orders the slabs would still compare equal.
+            stacked = torch.randn([args.tp, *shape], generator=generator)
+            if name == "incoming_pre_mix":
+                stacked = torch.softmax(stacked, dim=-1)
+        else:
+            stacked = value.unsqueeze(0).repeat(args.tp, *([1] * len(shape)))
+        specs.append(
+            TensorSpec(name, [args.tp, *shape], value.dtype, init_value=stacked, resident="stacked")
+        )
+    for name, shape, dtype in (
+        ("attention_output", [local, D], torch.bfloat16),
+        ("attention_hidden", [local, HC_MULT, D], torch.float32),
+        ("attention_pre_mix", [local, HC_MULT], torch.float32),
+    ):
+        sentinel = 13.0 if name == "attention_output" else 0.0
+        specs.append(TensorSpec(name, [args.tp, *shape], dtype, init_value=sentinel, resident="stacked"))
+    specs.append(
+        TensorSpec(
+            "gathered", [args.tp, args.tokens, D], torch.bfloat16,
+            init_value=13.0, resident="stacked",
+        )
+    )
+    specs.append(ScalarSpec("num_tokens", torch.int32, args.active_tokens))
+    specs.append(
+        ScalarSpec(
+            "attention_epoch",
+            torch.int32,
+            1,
+            compile_runtime=True,
+            benchmark_step=None,
+        )
+    )
+    return specs
+
+
+def assemble_specs(args, leaf_specs, spec_names, aliases=None):
+    """Combine one leaf's exact specs with the stable half-layer boundary specs."""
+    aliases = aliases or {}
+    specs = []
+    for spec in leaf_specs:
+        name = aliases.get(spec.name, spec.name)
+        if name in ("x", "output", *SCALAR_NAMES):
+            continue
+        specs.append(spec if name == spec.name else replace(spec, name=name))
+    specs.extend(make_boundary_specs(args))
+    by_name = {spec.name: spec for spec in specs}
+    missing = [name for name in spec_names if name not in by_name]
+    if missing:
+        raise ValueError(f"missing Attention specs: {missing}")
+    return [by_name[name] for name in spec_names]
+
+
 def build_specs(args):
     """Specs for the TP1 SWA attention composition."""
     value_build_swa_specs = build_swa_leaf_specs(args, 'decode')
@@ -304,6 +395,28 @@ def comparisons(args, devices):
     return compare
 
 
+def window_cache_compare(
+    world_size, tokens, payload_atol=0.0, payload_rtol=0.0, payload_error_ratio=0.0,
+    scale_rtol=0.0, scale_error_ratio=0.0,
+):
+    """Compare the mapped window rows and require every other row to stay unchanged."""
+    options = dict(
+        mapping_shape=(world_size, tokens),
+        block_size=128,
+        leading_rank_axis=True,
+    )
+    return {
+        "window_cache": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache",
+            atol=payload_atol, rtol=payload_rtol, max_error_ratio=payload_error_ratio, **options
+        ),
+        "window_cache_scale": mapped_pool_ratio_allclose(
+            "window_slots", pool_name="window cache scale",
+            atol=0.0, rtol=scale_rtol, max_error_ratio=scale_error_ratio, **options
+        ),
+    }
+
+
 if __name__ == "__main__":
     from utils import parse_decode_startpos
 
@@ -313,7 +426,8 @@ if __name__ == "__main__":
     from golden import run
 
     parser = argparse.ArgumentParser(description="DeepSeek V4.1 TP1 SWA decode composition")
-    parser.add_argument("-p", "--platform", default="a5", choices=("a5", "a5sim"))
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a5"], default="a5")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("-d", "--device", type=int, default=0)
     startpos_help = "one position per request; omitted: default validation workload"
     parser.add_argument("--startpos", type=parse_decode_startpos, help=startpos_help)
@@ -337,7 +451,7 @@ if __name__ == "__main__":
         golden_fn=golden_decode_swa,
         compare_fn=comparisons(args, devices),
         config={
-            "platform": args.platform,
+            "backend_type": args.backend_type, "execution_mode": args.execution_mode,
             "enable_chip_swimlane": args.enable_chip_swimlane,
             "distributed_config": DistributedConfig(device_ids=devices, num_sub_workers=0),
         },

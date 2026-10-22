@@ -24,7 +24,7 @@ A GLM-5.3-Flash MoE layer's feed-forward half is two branches that meet once:
 ``moe_layer_add`` then adds the two, with the inactive capacity rows written as
 zeros. The residual / hyper-connection path is downstream and out of scope here: this
 file ends at the MLP contribution to the sublayer. The router is the head of the
-block, so the entry runs ``moe_gate`` (deferred norm + router + INT8 view) and
+block, so the entry runs ``moe_gate`` (normalized router + INT8 view) and
 then the two branches over its outputs.
 
 Scope policy: the hyper-connection coefficients, ``hc_pre`` / ``hc_post``,
@@ -154,7 +154,7 @@ def decode_mlp(
     x_int8 = pl.create_tensor([T, D], dtype=pl.INT8)
     x_scale = pl.create_tensor([T, 1], dtype=pl.FP32)
 
-    # Block head: deferred norm + router + the INT8 view both branches reuse.
+    # Block head: normalized router and the INT8 view both branches reuse.
     moe_gate(
         x_mixed, norm_weight, gate_weight, correction_bias,
         route_weights, route_indices, x_int8, x_scale, num_tokens,
@@ -164,7 +164,7 @@ def decode_mlp(
     pack_tid = moe_pack(
         route_indices, route_weights, x_int8, x_scale,
         lane_x, lane_aux, lane_count, lane_ready,
-        num_tokens, num_ranks, my_rank, epoch,
+        num_tokens, num_ranks, my_rank,
     )
     # Empty owners must still finish the preceding TP stage before waiting for EP.
     pack_tid = pl.system.task_dummy(deps=[pack_tid, input_tid])
@@ -187,7 +187,7 @@ def decode_mlp(
         expert_out,
     )
     return_tid = moe_return(expert_out, recv_src, recv_route, slot_out, arrive_total)
-    sync_tid = moe_return_notify(return_ready, num_ranks, my_rank, epoch, return_tid)
+    sync_tid = moe_return_notify(return_ready, num_ranks, my_rank, return_tid)
     moe_combine(
         slot_out, return_ready, routed, num_tokens, num_ranks, my_rank, epoch, sync_tid
     )
@@ -354,7 +354,18 @@ def golden_decode_layer(tensors):
     tensors["y"][:] = out
 
 
-def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE):
+def build_tensor_specs(num_tokens=T, *, num_ranks=EP_SIZE, checkpoint=None, layer_id=3, hidden=None):
+    """Build generated fixtures or load a checkpoint's complete MoE FFN weights."""
+    if checkpoint is not None:
+        from models.glm5_3_flash.utils import build_checkpoint_moe_specs
+
+        return build_checkpoint_moe_specs(
+            checkpoint, layer_id,
+            capacity=T, num_tokens=num_tokens, num_ranks=num_ranks, hidden=hidden,
+        )
+    if hidden is not None:
+        raise ValueError("hidden activations require checkpoint weights")
+
     from golden import ScalarSpec, TensorSpec
 
     num_tokens = max(0, min(T, int(num_tokens)))
@@ -451,14 +462,26 @@ if __name__ == "__main__":
     from pypto.ir import DistributedConfig
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--platform", type=str, default="a2a3", choices=["a2a3", "a2a3sim", "a5", "a5sim"])
+    parser.add_argument("-p", "--platform", dest="backend_type", choices=["a2a3", "a5"], default="a2a3")
+    parser.add_argument("--sim", dest="execution_mode", action="store_true")
     parser.add_argument("--ep", type=int, default=2, help="expert-parallel size / rank count")
     parser.add_argument("-d", "--device", type=str, default=",".join(str(i) for i in range(N_RANKS)),
                         help=f"comma-separated device ids (need {N_RANKS})")
-    parser.add_argument("--num-tokens", type=int, default=T)
+    parser.add_argument("--num-tokens", type=int, default=None, help="active rows; defaults to hidden rows or capacity")
+    parser.add_argument("--checkpoint", type=Path, help="W8A8 checkpoint directory; default: generated weights")
+    parser.add_argument("--layer", type=int, default=3, help="checkpoint MoE layer index (default: 3)")
+    parser.add_argument("--hidden", type=Path, help="saved BF16 [EP, active tokens, D] x_mixed; requires --checkpoint")
+    parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--enable-chip-swimlane", type=int, nargs="?", const=1, default=0, choices=range(5))
     parser.add_argument("--dump-passes", action="store_true", default=False)
     args = parser.parse_args()
+
+    if args.hidden is not None and args.checkpoint is None:
+        parser.error("--hidden requires --checkpoint")
+    hidden = torch.load(args.hidden, map_location="cpu", weights_only=True) if args.hidden is not None else None
+    if hidden is not None and (not isinstance(hidden, torch.Tensor) or hidden.ndim != 3):
+        parser.error("--hidden must contain a BF16 tensor shaped [EP, active tokens, D]")
+    num_tokens = args.num_tokens if args.num_tokens is not None else (hidden.shape[1] if hidden is not None else T)
 
     device_ids = [int(d) for d in args.device.split(",")]
     assert len(device_ids) == N_RANKS, f"need exactly {N_RANKS} devices, got {device_ids}"
@@ -466,11 +489,14 @@ if __name__ == "__main__":
 
     result = run(
         fn=l3_decode_layer,
-        specs=build_tensor_specs(args.num_tokens, num_ranks=num_ranks),
+        specs=build_tensor_specs(
+            num_tokens, num_ranks=num_ranks, checkpoint=args.checkpoint, layer_id=args.layer, hidden=hidden,
+        ),
         golden_fn=golden_decode_layer,
         config=dict(
             dump_passes=args.dump_passes,
-            platform=args.platform,
+            backend_type=args.backend_type,
+            execution_mode=args.execution_mode,
             distributed_config=DistributedConfig(device_ids=device_ids, num_sub_workers=0),
             enable_chip_swimlane=args.enable_chip_swimlane,
         ),
@@ -487,6 +513,7 @@ if __name__ == "__main__":
             # (route, slot, barrier) still land far outside either.
             "y": ratio_reldiff(diff_thd=1e-2, pct_thd=0.05),
         },
+        compile_only=args.compile_only,
     )
     if not result.passed:
         if result.error:

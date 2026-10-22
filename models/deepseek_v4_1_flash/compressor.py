@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Compression projections, rotary embedding, cache publication, and ratio-2 ring state."""
 
+from gemm import gemm_bf16_to_bf16_staged
+
 import pypto.language as pl
 import torch
 
@@ -15,7 +17,6 @@ from config import (
     FLASH as M, STATE_CAPACITY, B_DYN, Q_START_DYN, STATE_BLOCKS_DYN,
     T_DYN, COMPRESSED_CACHE_GROUP, CMP_BLOCKS_DYN,
 )
-from quant import bf16_gemm_staged
 from rmsnorm import golden_rms_norm
 
 
@@ -31,7 +32,8 @@ M_TILE = 16
 N_TILE = 128
 COMPRESSOR_K_TILE = 64
 COMPRESSOR_QUERY_TILE = 128
-COMPRESSOR_SEGMENTS = 16
+# Limit Cube rounding before the compensated Vector accumulation.
+COMPRESSOR_SEGMENTS = D // COMPRESSOR_K_TILE
 COMPRESSOR_K_CHUNK = D // COMPRESSOR_SEGMENTS
 COMPRESSOR_PROJ_N_TILE = 128
 COMPRESSOR_PROJ_K_TILE = 256
@@ -106,8 +108,8 @@ def project_ratio2_weights(
             chunk_active = pl.min(chunk_rows, num_tokens - begin)
             output_blocks = (chunk_active + M_TILE - 1) // M_TILE * (HEAD_DIM // N_TILE)
             blocks = output_blocks * COMPRESSOR_SEGMENTS
-            # The synchronous mixed cohort must fit the target A5 core count.
-            workers = pl.min(blocks, 16)
+            # The synchronous mixed cohort must fit the available runtime clusters.
+            workers = pl.min(pl.min(blocks, 16), pl.system.available_cluster_count())
             with pl.spmd(workers, name_hint="c2a_compressor_cube", deps=[completion[0]], sync_start=True) as cube_tid:
                 cube_worker = pl.tile.get_block_idx()
                 for cube_block in pl.range(cube_worker, blocks, workers):
@@ -450,7 +452,7 @@ def prefill_c1a_compressor_project(
     num_tokens: pl.Scalar[pl.INT32],
 ):
     ready = pl.system.task_dummy(deps=[])
-    result, completed = bf16_gemm_staged(
+    result, completed = gemm_bf16_to_bf16_staged(
         source, weight, output, num_tokens, ready,
         width=D, output_width=HEAD_DIM, n_tile=COMPRESSOR_PROJ_N_TILE, k_tile=COMPRESSOR_PROJ_K_TILE,
         workers=2147483647, name_hint='prefill_bf16_projection_cube',
@@ -539,10 +541,10 @@ def decode_c1a_compressor_project(
     num_tokens: pl.Scalar[pl.INT32],
     ready: pl.Scalar[pl.TASK_ID],
 ):
-    result, completed = bf16_gemm_staged(
+    result, completed = gemm_bf16_to_bf16_staged(
         source, weight, output, num_tokens, ready,
         width=D, output_width=HEAD_DIM, n_tile=COMPRESSOR_PROJ_N_TILE, k_tile=COMPRESSOR_PROJ_K_TILE,
-        workers=32, name_hint='c1a_compressor_projection',
+        workers=8, name_hint='c1a_compressor_projection',
     )
     return completed
 
