@@ -66,8 +66,7 @@ NEG_INF = -1.0e20       # finite floor; a true -inf would make an all-masked row
 ATTN_K_TILE = 128       # selected rows per sparse block
 NUM_QK_CORES = 24       # qk_pv dispatch lanes = a2a3 AIC count
 H_TILE = min(LOCAL_H, 16)
-if H_TILE != LOCAL_H:
-    raise ValueError(f"sparse MLA attention needs TP >= 4 (LOCAL_H={LOCAL_H} > 16 heads per tile)")
+HEAD_BLOCKS = (LOCAL_H + H_TILE - 1) // H_TILE
 H_PAD = ((H_TILE + 15) // 16) * 16
 SPARSE_BLOCKS = (TOPK_INDEX_WIDTH + ATTN_K_TILE - 1) // ATTN_K_TILE
 
@@ -170,19 +169,20 @@ def decode_sparse_attn(
     q_flat = pl.reshape(absorbed_query, [t_dim * LOCAL_H, KV_LORA])
     out_flat = pl.reshape(output, [t_dim * LOCAL_H, KV_LORA])
 
-    blk_mi = pl.create_tensor([t_dim * SPARSE_BLOCKS * H_PAD, 1], dtype=pl.FP32)
-    blk_li = pl.create_tensor([t_dim * SPARSE_BLOCKS * H_PAD, 1], dtype=pl.FP32)
-    blk_oi = pl.create_tensor([t_dim * SPARSE_BLOCKS * H_PAD, KV_LORA], dtype=pl.FP32)
+    blk_mi = pl.create_tensor([t_dim * HEAD_BLOCKS * SPARSE_BLOCKS * H_PAD, 1], dtype=pl.FP32)
+    blk_li = pl.create_tensor([t_dim * HEAD_BLOCKS * SPARSE_BLOCKS * H_PAD, 1], dtype=pl.FP32)
+    blk_oi = pl.create_tensor([t_dim * HEAD_BLOCKS * SPARSE_BLOCKS * H_PAD, KV_LORA], dtype=pl.FP32)
     with pl.spmd(NUM_QK_CORES, name_hint="mla_decode_qk_pv") as qk_tid:
         lane = pl.tile.get_block_idx()
-        items = t_dim * SPARSE_BLOCKS
+        items = t_dim * HEAD_BLOCKS * SPARSE_BLOCKS
         for it in pl.range((items - lane + NUM_QK_CORES - 1) // NUM_QK_CORES):
             item = lane + it * NUM_QK_CORES
-            token = item // SPARSE_BLOCKS
-            sb = item - token * SPARSE_BLOCKS
+            token = item // (HEAD_BLOCKS * SPARSE_BLOCKS)
+            head = (item // SPARSE_BLOCKS) % HEAD_BLOCKS
+            sb = item % SPARSE_BLOCKS
             w0 = sb * ATTN_K_TILE
             request = pl.cast(pl.read(request_ids, [token]), pl.INDEX)
-            blk_row = (token * SPARSE_BLOCKS + sb) * H_PAD
+            blk_row = ((token * HEAD_BLOCKS + head) * SPARSE_BLOCKS + sb) * H_PAD
             # Lane 0 is -1 only when the whole block is padding.
             if pl.read(topk_indices, [token, w0]) < 0:
                 blk_mi[blk_row : blk_row + H_PAD, 0:1] = pl.reshape(
@@ -221,7 +221,7 @@ def decode_sparse_attn(
                     pl.slice(
                         q_flat,
                         [H_PAD, KV_LORA],
-                        [token * LOCAL_H, 0],
+                        [token * LOCAL_H + head * H_TILE, 0],
                         valid_shape=[H_TILE, KV_LORA],
                     ),
                     pad_value=pl.PadValue.zero,
@@ -231,16 +231,17 @@ def decode_sparse_attn(
                 mi = pl.row_max(scores)
                 weights = pl.exp(pl.row_expand_sub(scores, mi))
                 li = pl.row_sum(weights)
-                oi = pl.matmul(
-                    pl.cast(weights, target_type=pl.BF16, mode="rint"), kv_tile, out_dtype=pl.FP32
-                )
+                weights_bf16 = pl.cast(weights, pl.BF16, mode="rint")
+                oi = pl.matmul(weights_bf16, kv_tile, out_dtype=pl.FP32)
                 blk_mi[blk_row : blk_row + H_PAD, 0:1] = mi
                 blk_li[blk_row : blk_row + H_PAD, 0:1] = li
                 blk_oi[blk_row : blk_row + H_PAD, 0:KV_LORA] = oi
 
-    with pl.spmd(t_dim, name_hint="mla_decode_merge", deps=[qk_tid]):
-        token = pl.tile.get_block_idx()
-        base = (token * SPARSE_BLOCKS) * H_PAD
+    with pl.spmd(t_dim * HEAD_BLOCKS, name_hint="mla_decode_merge", deps=[qk_tid]):
+        task = pl.tile.get_block_idx()
+        token = task // HEAD_BLOCKS
+        head = task % HEAD_BLOCKS
+        base = ((token * HEAD_BLOCKS + head) * SPARSE_BLOCKS) * H_PAD
         merged_mi = blk_mi[base : base + H_PAD, 0:1]
         merged_li = blk_li[base : base + H_PAD, 0:1]
         merged_oi = blk_oi[base : base + H_PAD, 0:KV_LORA]
@@ -262,11 +263,11 @@ def decode_sparse_attn(
         if pl.read(topk_indices, [token, 0]) >= 0:
             normalized = pl.row_expand_div(merged_oi, merged_li)
             out_bf16 = pl.cast(normalized, target_type=pl.BF16, mode="rint")
-            out_flat[token * LOCAL_H : token * LOCAL_H + H_TILE, 0:KV_LORA] = out_bf16[
+            out_flat[token * LOCAL_H + head * H_TILE : token * LOCAL_H + (head + 1) * H_TILE, 0:KV_LORA] = out_bf16[
                 0:H_TILE, 0:KV_LORA
             ]
         else:
-            out_flat[token * LOCAL_H : token * LOCAL_H + H_TILE, 0:KV_LORA] = pl.full(
+            out_flat[token * LOCAL_H + head * H_TILE : token * LOCAL_H + (head + 1) * H_TILE, 0:KV_LORA] = pl.full(
                 [H_TILE, KV_LORA], dtype=pl.BF16, value=0.0
             )
     return output
